@@ -648,10 +648,14 @@ async def api_start_interview(req: StartInterviewRequest, request: Request):
 
     lk = api.LiveKitAPI(LIVEKIT_URL)
     try:
+        md_json = json.dumps(interview_data)
+        # Ensure metadata is set even for long-lived rooms.
         try:
-            await lk.room.create_room(api.CreateRoomRequest(name=room, metadata=json.dumps(interview_data)))
+            await lk.room.create_room(api.CreateRoomRequest(name=room, metadata=md_json))
         except Exception:
-            await lk.room.update_room_metadata(api.UpdateRoomMetadataRequest(room=room, metadata=json.dumps(interview_data)))
+            # Room likely already exists.
+            pass
+        await lk.room.update_room_metadata(api.UpdateRoomMetadataRequest(room=room, metadata=md_json))
 
         # Always dispatch (in-memory state/participant listing can be stale for long-lived rooms).
         await lk.agent_dispatch.create_dispatch(api.CreateAgentDispatchRequest(room=room, agent_name=LIVEKIT_AGENT_NAME))
@@ -729,11 +733,31 @@ async def api_token(room: str, identity: str, name: str = "Participant"):
     return {"token": t.to_jwt(), "room": room, "livekitUrl": LIVEKIT_URL}
 
 
+@app.get("/api/debug/room/{interview_id}")
+async def api_debug_room(interview_id: str):
+    room = f"interview-{interview_id}"
+    lk = api.LiveKitAPI(LIVEKIT_URL)
+    try:
+        rp = await lk.room.list_participants(api.ListParticipantsRequest(room=room))
+        participants = getattr(rp, "participants", None) or []
+        rr = await lk.room.list_rooms(api.ListRoomsRequest(names=[room]))
+        rooms = getattr(rr, "rooms", None) or []
+        md = rooms[0].metadata if rooms else None
+        return {
+            "room": room,
+            "participant_count": len(participants),
+            "participants": [{"identity": getattr(p, "identity", None), "name": getattr(p, "name", None)} for p in participants],
+            "metadata_present": bool(md),
+        }
+    finally:
+        await lk.aclose()
+
+
 if __name__ == "__main__":
     import uvicorn
 
     port = int(os.getenv("API_PORT", "8021"))
     # For auto-reload, uvicorn needs an import string (recommended: run via CLI).
     # This works too when running `python main.py`.
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
 
