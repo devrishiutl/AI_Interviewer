@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 from livekit import agents
@@ -25,8 +26,9 @@ from all_functions import (
     tts_speaker,
 )
 
+_DOTENV_PATH = Path(__file__).with_name(".env")
 try:
-    load_dotenv()
+    load_dotenv(dotenv_path=_DOTENV_PATH, override=False)
 except Exception:
     # Don't fail module import if .env isn't readable in the current environment.
     pass

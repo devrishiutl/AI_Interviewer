@@ -6,6 +6,7 @@ AI Interview Bot API (minimal)
 """
 
 import io
+import asyncio
 import json
 import os
 import time
@@ -21,6 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pypdf import PdfReader
 from livekit import api
+from livekit.api.twirp_client import TwirpError
 
 _DOTENV_PATH = Path(__file__).with_name(".env")
 load_dotenv(dotenv_path=_DOTENV_PATH, override=False)
@@ -626,7 +628,9 @@ async def api_start_interview(req: StartInterviewRequest, request: Request):
     # LiveKit room + dispatch
     room = f"interview-{req.interviewId}"
     applicant_id_for_identity = applicant_id or req.interviewId
-    identity = f"candidate-{applicant_id_for_identity}"
+    # IMPORTANT: identity must be unique per join, otherwise the browser can fail to connect
+    # if a stale session with the same identity still exists.
+    identity = f"candidate-{applicant_id_for_identity}-{uuid.uuid4().hex[:8]}"
 
     token = (
         api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
@@ -650,16 +654,35 @@ async def api_start_interview(req: StartInterviewRequest, request: Request):
     try:
         md_json = json.dumps(interview_data)
         # Ensure metadata is set even for long-lived rooms.
+        # If room doesn't exist, create it, then update metadata.
         try:
+            await lk.room.update_room_metadata(api.UpdateRoomMetadataRequest(room=room, metadata=md_json))
+        except TwirpError as e:
+            if getattr(e, "code", None) != "not_found":
+                raise
             await lk.room.create_room(api.CreateRoomRequest(name=room, metadata=md_json))
-        except Exception:
-            # Room likely already exists.
-            pass
-        await lk.room.update_room_metadata(api.UpdateRoomMetadataRequest(room=room, metadata=md_json))
+            await lk.room.update_room_metadata(api.UpdateRoomMetadataRequest(room=room, metadata=md_json))
 
         # Always dispatch (in-memory state/participant listing can be stale for long-lived rooms).
         await lk.agent_dispatch.create_dispatch(api.CreateAgentDispatchRequest(room=room, agent_name=LIVEKIT_AGENT_NAME))
         _DISPATCHED_INTERVIEWS.add(req.interviewId)
+
+        # Best-effort: wait briefly for agent to join so the client can know if dispatch worked.
+        agent_joined = False
+        for _ in range(10):
+            try:
+                lp = await lk.room.list_participants(api.ListParticipantsRequest(room=room))
+                participants = getattr(lp, "participants", None) or []
+                # Only treat identities starting with agent- as the agent (avoid false positives from other candidates).
+                agent_joined = any(
+                    isinstance(getattr(p, "identity", None), str) and getattr(p, "identity").startswith("agent-")
+                    for p in participants
+                )
+                if agent_joined:
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.3)
     finally:
         await lk.aclose()
 
@@ -670,6 +693,7 @@ async def api_start_interview(req: StartInterviewRequest, request: Request):
         "livekitUrl": LIVEKIT_URL,
         "identity": identity,
         "transcriptRecordId": transcript_record_id,
+        "agentJoined": agent_joined,
     }
 
 
@@ -738,13 +762,20 @@ async def api_debug_room(interview_id: str):
     room = f"interview-{interview_id}"
     lk = api.LiveKitAPI(LIVEKIT_URL)
     try:
-        rp = await lk.room.list_participants(api.ListParticipantsRequest(room=room))
+        try:
+            rp = await lk.room.list_participants(api.ListParticipantsRequest(room=room))
+        except TwirpError as e:
+            if getattr(e, "code", None) == "not_found":
+                return {"room": room, "exists": False, "participant_count": 0, "participants": [], "metadata_present": False}
+            raise
+
         participants = getattr(rp, "participants", None) or []
         rr = await lk.room.list_rooms(api.ListRoomsRequest(names=[room]))
         rooms = getattr(rr, "rooms", None) or []
         md = rooms[0].metadata if rooms else None
         return {
             "room": room,
+            "exists": True,
             "participant_count": len(participants),
             "participants": [{"identity": getattr(p, "identity", None), "name": getattr(p, "name", None)} for p in participants],
             "metadata_present": bool(md),
