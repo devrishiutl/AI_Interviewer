@@ -35,6 +35,38 @@ except Exception:
     pass
 
 
+_PLUGINS = {
+    "deepgram": None,
+    "noise_cancellation": None,
+    "openai": None,
+    "sarvam": None,
+    "silero": None,
+}
+
+
+def prewarm(proc: agents.JobProcess):
+    """
+    LiveKit plugins register themselves at import time.
+    On Windows (and with multiprocessing 'spawn'), importing plugins from a job task can crash with:
+      RuntimeError: Plugins must be registered on the main thread
+
+    prewarm_fnc runs on the job process main thread, and must be a TOP-LEVEL function
+    (so it can be pickled/imported by multiprocessing).
+    """
+    try:
+        from livekit.plugins import deepgram, noise_cancellation, openai, sarvam, silero
+
+        _PLUGINS["deepgram"] = deepgram
+        _PLUGINS["noise_cancellation"] = noise_cancellation
+        _PLUGINS["openai"] = openai
+        _PLUGINS["sarvam"] = sarvam
+        _PLUGINS["silero"] = silero
+    except Exception:
+        # Let the worker boot; failures will be visible in logs.
+        print("⚠️ Plugin prewarm import failed:")
+        print(traceback.format_exc())
+
+
 class InterviewerAgent(Agent):
     def __init__(self, instructions: str):
         super().__init__(instructions=instructions)
@@ -98,8 +130,14 @@ async def entrypoint(ctx: agents.JobContext):
             print("❌ SARVAM_API_KEY missing (agent will not join)")
             return
 
-        # Lazy imports so module import doesn't hard-fail if plugins aren't installed.
-        from livekit.plugins import deepgram, noise_cancellation, openai, sarvam, silero
+        # Plugins are imported/registered during process prewarm on the main thread (see prewarm()).
+        deepgram = _PLUGINS["deepgram"]
+        noise_cancellation = _PLUGINS["noise_cancellation"]
+        openai = _PLUGINS["openai"]
+        sarvam = _PLUGINS["sarvam"]
+        silero = _PLUGINS["silero"]
+        if not all([deepgram, noise_cancellation, openai, sarvam, silero]):
+            raise RuntimeError("LiveKit plugins not loaded. Did prewarm() fail?")
 
         await ctx.connect()
         print(f"✅ Connected to room: {getattr(ctx.room, 'name', '')}")
@@ -153,8 +191,24 @@ async def entrypoint(ctx: agents.JobContext):
             room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC(), close_on_disconnect=False),
         )
 
+        # Wait until at least one remote participant (candidate) is present before speaking.
+        # Otherwise the "interview starts" with only the agent in the room.
+        print("⏳ Waiting for candidate to join…")
+        while True:
+            try:
+                remotes = getattr(ctx.room, "remote_participants", None) or {}
+                if len(remotes) > 0:
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
         welcome = build_welcome(md)
-        await session.say(welcome)
+        try:
+            await session.say(welcome)
+        except Exception as e:
+            # If TTS is misconfigured / out of credits, keep the job alive (the room join still helps debugging).
+            print(f"⚠️ welcome TTS failed: {type(e).__name__}: {e}")
         # Ensure welcome is captured even if the SDK doesn't emit a conversation-item callback for TTS.
         asyncio.create_task(post_transcript(session._ctx, role="Interviewer", text=welcome))
 
@@ -178,7 +232,13 @@ if __name__ == "__main__":
     agents.cli.run_app(
         agents.WorkerOptions(
             entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
             agent_name=os.getenv("LIVEKIT_AGENT_NAME", "interview-agent"),
+            # Reduce "assignment timed out" by keeping at least one warm job process ready.
+            # In dev the default can be 0 which forces a cold spawn on first job.
+            num_idle_processes=1,
+            # Give the process more time to initialize under load / slow machines.
+            initialize_process_timeout=30.0,
         )
     )
 
