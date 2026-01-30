@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import sys
+import traceback
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -90,72 +91,79 @@ class InterviewSession(AgentSession):
 
 
 async def entrypoint(ctx: agents.JobContext):
-    print("🎯 Agent starting...")
-    sarvam_key = os.getenv("SARVAM_API_KEY")
-    if not sarvam_key:
-        print("❌ SARVAM_API_KEY missing")
-        return
-
-    # Lazy imports so module import doesn't hard-fail if plugins aren't installed.
-    from livekit.plugins import deepgram, noise_cancellation, openai, sarvam, silero
-
-    await ctx.connect()
-    # Metadata can arrive slightly after connect.
-    for _ in range(10):
-        if ctx.room.metadata:
-            break
-        await asyncio.sleep(0.3)
-    if not ctx.room.metadata:
-        print("❌ No room metadata (start interview via /api/start-interview)")
-        return
-
     try:
-        md = json.loads(ctx.room.metadata)
-    except Exception as e:
-        print(f"❌ Invalid metadata JSON: {e}")
-        return
-    if not isinstance(md, dict) or not md.get("applicant") or not md.get("job"):
-        print("❌ Missing required metadata (applicant/job)")
-        return
+        print("🎯 Agent job received; starting…")
+        sarvam_key = os.getenv("SARVAM_API_KEY")
+        if not sarvam_key:
+            print("❌ SARVAM_API_KEY missing (agent will not join)")
+            return
 
-    session = InterviewSession(
-        stt=deepgram.STT(model="nova-2", language="en"),
-        llm=openai.LLM(model="gpt-4o-mini", temperature=0.3),
-        tts=sarvam.TTS(
-            target_language_code="en-IN",
-            model="bulbul:v2",
-            speaker=tts_speaker(md),
-            api_key=sarvam_key,
-        ),
-        vad=silero.VAD.load(),
-        turn_detection=maybe_turn_detection(),
-    )
+        # Lazy imports so module import doesn't hard-fail if plugins aren't installed.
+        from livekit.plugins import deepgram, noise_cancellation, openai, sarvam, silero
 
-    session.set_ctx(
-        {
-            "room": getattr(ctx.room, "name", "") or "",
-            "interviewId": md.get("interviewId"),
-            "transcriptRecordId": md.get("transcriptRecordId"),
-            "candidateName": (md.get("applicant") or {}).get("name") or "Candidate",
-            "interviewerName": (md.get("interviewer") or {}).get("name") or "Interviewer",
-            "transcriptApiUrl": md.get("transcriptApiUrl"),
-        }
-    )
+        await ctx.connect()
+        print(f"✅ Connected to room: {getattr(ctx.room, 'name', '')}")
 
-    await session.start(
-        room=ctx.room,
-        agent=InterviewerAgent(instructions=build_instructions(md)),
-        # Keep agent running even if the browser disconnects/reconnects.
-        room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC(), close_on_disconnect=False),
-    )
+        # Metadata can arrive slightly after connect.
+        for _ in range(20):
+            if ctx.room.metadata:
+                break
+            await asyncio.sleep(0.25)
+        if not ctx.room.metadata:
+            print("❌ No room metadata (start interview via /api/start-interview)")
+            return
 
-    welcome = build_welcome(md)
-    await session.say(welcome)
-    # Ensure welcome is captured even if the SDK doesn't emit a conversation-item callback for TTS.
-    asyncio.create_task(post_transcript(session._ctx, role="Interviewer", text=welcome))
+        try:
+            md = json.loads(ctx.room.metadata)
+        except Exception as e:
+            print(f"❌ Invalid metadata JSON: {e}")
+            return
+        if not isinstance(md, dict) or not md.get("applicant") or not md.get("job"):
+            print("❌ Missing required metadata (applicant/job)")
+            return
 
-    while True:
-        await asyncio.sleep(1)
+        session = InterviewSession(
+            stt=deepgram.STT(model="nova-2", language="en"),
+            llm=openai.LLM(model="gpt-4o-mini", temperature=0.3),
+            tts=sarvam.TTS(
+                target_language_code="en-IN",
+                model="bulbul:v2",
+                speaker=tts_speaker(md),
+                api_key=sarvam_key,
+            ),
+            vad=silero.VAD.load(),
+            turn_detection=maybe_turn_detection(),
+        )
+
+        session.set_ctx(
+            {
+                "room": getattr(ctx.room, "name", "") or "",
+                "interviewId": md.get("interviewId"),
+                "transcriptRecordId": md.get("transcriptRecordId"),
+                "candidateName": (md.get("applicant") or {}).get("name") or "Candidate",
+                "interviewerName": (md.get("interviewer") or {}).get("name") or "Interviewer",
+                "transcriptApiUrl": md.get("transcriptApiUrl"),
+            }
+        )
+
+        await session.start(
+            room=ctx.room,
+            agent=InterviewerAgent(instructions=build_instructions(md)),
+            # Keep agent running even if the browser disconnects/reconnects.
+            room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC(), close_on_disconnect=False),
+        )
+
+        welcome = build_welcome(md)
+        await session.say(welcome)
+        # Ensure welcome is captured even if the SDK doesn't emit a conversation-item callback for TTS.
+        asyncio.create_task(post_transcript(session._ctx, role="Interviewer", text=welcome))
+
+        while True:
+            await asyncio.sleep(1)
+    except Exception:
+        print("❌ Agent crashed while starting/joining:")
+        print(traceback.format_exc())
+        raise
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from pypdf import PdfReader
 from livekit import api
 from livekit.api.twirp_client import TwirpError
+from livekit.protocol import room as room_proto
 
 _DOTENV_PATH = Path(__file__).with_name(".env")
 load_dotenv(dotenv_path=_DOTENV_PATH, override=False)
@@ -32,7 +33,12 @@ app = FastAPI(title="AI Interview Bot API")
 # Allow browser clients to call this API (local dev / playground / frontend)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # If allow_credentials=True, CORS cannot use wildcard "*" origins.
+    # Add your frontend origins explicitly.
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -54,6 +60,8 @@ LIVEKIT_API_KEY = _require_env("LIVEKIT_API_KEY")
 LIVEKIT_API_SECRET = _require_env("LIVEKIT_API_SECRET")
 LIVEKIT_AGENT_NAME = os.getenv("LIVEKIT_AGENT_NAME", "interview-agent")
 PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "")  # optional; needed for remote agent
+LIVEKIT_EMPTY_TIMEOUT_S = int(os.getenv("LIVEKIT_EMPTY_TIMEOUT_S", "300"))
+LIVEKIT_DEPARTURE_TIMEOUT_S = int(os.getenv("LIVEKIT_DEPARTURE_TIMEOUT_S", "60"))
 
 HRONE_API = os.getenv("HRONE_API_URL", "https://api.hrone.studio/api")
 APP_ID = _require_env("HRONE_APP_ID")
@@ -660,29 +668,118 @@ async def api_start_interview(req: StartInterviewRequest, request: Request):
         except TwirpError as e:
             if getattr(e, "code", None) != "not_found":
                 raise
-            await lk.room.create_room(api.CreateRoomRequest(name=room, metadata=md_json))
+            await lk.room.create_room(
+                api.CreateRoomRequest(
+                    name=room,
+                    metadata=md_json,
+                    empty_timeout=LIVEKIT_EMPTY_TIMEOUT_S,
+                    departure_timeout=LIVEKIT_DEPARTURE_TIMEOUT_S,
+                )
+            )
             await lk.room.update_room_metadata(api.UpdateRoomMetadataRequest(room=room, metadata=md_json))
 
-        # Always dispatch (in-memory state/participant listing can be stale for long-lived rooms).
-        await lk.agent_dispatch.create_dispatch(api.CreateAgentDispatchRequest(room=room, agent_name=LIVEKIT_AGENT_NAME))
-        _DISPATCHED_INTERVIEWS.add(req.interviewId)
+        # --- Agent dispatch idempotency ---
+        # Goal: only one agent in the room and avoid stacking dispatch jobs.
+        dispatch = None
+
+        # 0) Cleanup dispatch list so we don't accumulate old/invalid rows.
+        # Keep at most one dispatch for (room, LIVEKIT_AGENT_NAME); delete everything else.
+        try:
+            existing = await lk.agent_dispatch.list_dispatch(room_name=room)
+            kept = None
+            for d in existing or []:
+                did = getattr(d, "id", None)
+                d_room = getattr(d, "room", None)
+                d_agent = getattr(d, "agent_name", None)
+                is_valid = (d_room == room) and (d_agent == LIVEKIT_AGENT_NAME)
+
+                if not isinstance(did, str) or not did:
+                    # Can't delete without an id; just ignore.
+                    continue
+
+                if is_valid and kept is None:
+                    kept = d
+                    continue
+
+                # Delete invalid dispatches and extra valid ones.
+                await lk.agent_dispatch.delete_dispatch(dispatch_id=did, room_name=room)
+
+            if kept is not None:
+                dispatch = kept
+        except TwirpError as e:
+            if getattr(e, "code", None) != "not_found":
+                raise
+        except Exception:
+            # Best-effort only; a failure here should not block interview start.
+            pass
+
+        # 1) If multiple agents are already in the room, kick extras (keep the first).
+        try:
+            lp0 = await lk.room.list_participants(api.ListParticipantsRequest(room=room))
+            participants0 = getattr(lp0, "participants", None) or []
+            agent_identities = [
+                str(getattr(p, "identity", "") or "")
+                for p in participants0
+                if isinstance(getattr(p, "identity", None), str) and getattr(p, "identity", "").startswith("agent-")
+            ]
+            if len(agent_identities) > 1:
+                # Keep the oldest/first one and remove the rest.
+                for extra in agent_identities[1:]:
+                    await lk.room.remove_participant(room_proto.RoomParticipantIdentity(room=room, identity=extra))
+        except Exception:
+            # Best-effort cleanup only.
+            pass
+
+        # 2) If an agent is already present, don't dispatch again. Also delete any queued dispatches.
+        agent_already_present = False
+        try:
+            lp1 = await lk.room.list_participants(api.ListParticipantsRequest(room=room))
+            participants1 = getattr(lp1, "participants", None) or []
+            agent_already_present = any(
+                isinstance(getattr(p, "identity", None), str)
+                and getattr(p, "identity")
+                and not str(getattr(p, "identity")).startswith("candidate-")
+                for p in participants1
+            )
+        except Exception:
+            agent_already_present = False
+
+        if agent_already_present:
+            try:
+                existing = await lk.agent_dispatch.list_dispatch(room_name=room)
+                for d in existing or []:
+                    did = getattr(d, "id", None)
+                    if isinstance(did, str) and did:
+                        await lk.agent_dispatch.delete_dispatch(dispatch_id=did, room_name=room)
+            except Exception:
+                pass
+        else:
+            # 3) If a matching dispatch already exists, reuse it (don't create more).
+            # (We may have already set dispatch via cleanup step above.)
+            if dispatch is None:
+                dispatch = await lk.agent_dispatch.create_dispatch(
+                    api.CreateAgentDispatchRequest(room=room, agent_name=LIVEKIT_AGENT_NAME)
+                )
+                _DISPATCHED_INTERVIEWS.add(req.interviewId)
 
         # Best-effort: wait briefly for agent to join so the client can know if dispatch worked.
         agent_joined = False
-        for _ in range(10):
+        for _ in range(30):
             try:
                 lp = await lk.room.list_participants(api.ListParticipantsRequest(room=room))
                 participants = getattr(lp, "participants", None) or []
-                # Only treat identities starting with agent- as the agent (avoid false positives from other candidates).
+                # Treat any non-candidate participant as the agent (avoids false positives from other candidates).
                 agent_joined = any(
-                    isinstance(getattr(p, "identity", None), str) and getattr(p, "identity").startswith("agent-")
+                    isinstance(getattr(p, "identity", None), str)
+                    and getattr(p, "identity")
+                    and not getattr(p, "identity").startswith("candidate-")
                     for p in participants
                 )
                 if agent_joined:
                     break
             except Exception:
                 pass
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.5)
     finally:
         await lk.aclose()
 
@@ -694,6 +791,7 @@ async def api_start_interview(req: StartInterviewRequest, request: Request):
         "identity": identity,
         "transcriptRecordId": transcript_record_id,
         "agentJoined": agent_joined,
+        "dispatchId": getattr(dispatch, "id", None),
     }
 
 
@@ -780,6 +878,103 @@ async def api_debug_room(interview_id: str):
             "participants": [{"identity": getattr(p, "identity", None), "name": getattr(p, "name", None)} for p in participants],
             "metadata_present": bool(md),
         }
+    finally:
+        await lk.aclose()
+
+
+@app.get("/api/debug/dispatches/{interview_id}")
+async def api_debug_dispatches(interview_id: str):
+    """
+    Debug helper: shows agent dispatch jobs created for this room.
+    If dispatches exist but agent isn't in participants, the worker likely crashed or couldn't connect.
+    """
+    room = f"interview-{interview_id}"
+    lk = api.LiveKitAPI(LIVEKIT_URL)
+    try:
+        try:
+            dispatches = await lk.agent_dispatch.list_dispatch(room_name=room)
+        except TwirpError as e:
+            # LiveKit returns not_found if the room hasn't been created yet.
+            if getattr(e, "code", None) == "not_found":
+                return {"room": room, "exists": False, "dispatch_count": 0, "dispatches": []}
+            raise
+
+        def _jsonable(v):
+            if v is None or isinstance(v, (str, int, float, bool)):
+                return v
+            # protobuf enums / timestamps / other objects
+            try:
+                return int(v)
+            except Exception:
+                return str(v)
+
+        return {
+            "room": room,
+            "exists": True,
+            "dispatch_count": len(dispatches or []),
+            "dispatches": [
+                {
+                    "id": getattr(d, "id", None),
+                    "agent_name": getattr(d, "agent_name", None),
+                    "room": getattr(d, "room", None),
+                    "metadata": getattr(d, "metadata", None),
+                    "state": _jsonable(getattr(d, "state", None)),
+                    "created_at": _jsonable(getattr(d, "created_at", None)),
+                }
+                for d in (dispatches or [])
+            ],
+        }
+    finally:
+        await lk.aclose()
+
+
+@app.post("/api/debug/reset/{interview_id}")
+async def api_debug_reset(interview_id: str):
+    """
+    Hard reset a room for debugging:
+    - delete all dispatches for the room
+    - remove all participants (agent + candidates)
+    - delete the room
+    This helps when stale workers/dispatches make behavior look random.
+    """
+    room = f"interview-{interview_id}"
+    lk = api.LiveKitAPI(LIVEKIT_URL)
+    kicked: list[str] = []
+    deleted_dispatches: list[str] = []
+    try:
+        # Delete dispatches (ignore not_found)
+        try:
+            existing = await lk.agent_dispatch.list_dispatch(room_name=room)
+            for d in existing or []:
+                did = getattr(d, "id", None)
+                if isinstance(did, str) and did:
+                    await lk.agent_dispatch.delete_dispatch(dispatch_id=did, room_name=room)
+                    deleted_dispatches.append(did)
+        except TwirpError as e:
+            if getattr(e, "code", None) != "not_found":
+                raise
+
+        # Kick participants (ignore not_found)
+        try:
+            rp = await lk.room.list_participants(api.ListParticipantsRequest(room=room))
+            participants = getattr(rp, "participants", None) or []
+            for p in participants:
+                ident = getattr(p, "identity", None)
+                if isinstance(ident, str) and ident:
+                    await lk.room.remove_participant(room_proto.RoomParticipantIdentity(room=room, identity=ident))
+                    kicked.append(ident)
+        except TwirpError as e:
+            if getattr(e, "code", None) != "not_found":
+                raise
+
+        # Delete room (ignore not_found)
+        try:
+            await lk.room.delete_room(api.DeleteRoomRequest(room=room))
+        except TwirpError as e:
+            if getattr(e, "code", None) != "not_found":
+                raise
+
+        return {"room": room, "deleted_dispatches": deleted_dispatches, "kicked": kicked, "deleted_room": True}
     finally:
         await lk.aclose()
 
