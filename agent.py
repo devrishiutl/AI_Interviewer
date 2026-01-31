@@ -16,7 +16,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from livekit import agents
 from livekit.agents import Agent, AgentSession, RoomInputOptions
-from all_functions import (
+from all_agent_functions import (
     build_instructions,
     build_welcome,
     dedupe_text,
