@@ -12,6 +12,28 @@ import base64
 
 import httpx
 
+from livekit.agents.llm import llm as lk_llm
+import asyncio
+
+def publish_playground_chat(room, text: str, *, topic: str = "lk-chat") -> None:
+    """
+    Publish a chat message so it shows up in the LiveKit Playground / useChat UI.
+    This uses LiveKit data packets (reliable).
+    """
+    if not text or not isinstance(text, str):
+        return
+    lp = getattr(room, "local_participant", None)
+    if lp is None:
+        return
+    # Most LiveKit UIs listen on "lk-chat"; also send on "chat" for compatibility.
+    try:
+        asyncio.create_task(lp.publish_data(text, topic=topic, reliable=True))
+        if topic != "chat":
+            asyncio.create_task(lp.publish_data(text, topic="chat", reliable=True))
+    except RuntimeError:
+        # No running loop (shouldn't happen inside an agent job); best-effort.
+        return
+
 # ============================================================================
 # BUILD PROMPTS FROM DISPATCHED DATA
 # ============================================================================
@@ -37,6 +59,19 @@ def download_turn_detector_files() -> None:
 def maybe_turn_detection():
     """Create turn-detection model if available; otherwise return None."""
     try:
+        # Turn-detector needs an inference executor; local/dev setups often don't have one.
+        try:
+            from livekit.agents.job import get_job_context
+
+            jc = get_job_context()
+            if getattr(jc, "inference_executor", None) is None:
+                print("⚠️ turn_detection disabled: no inference executor")
+                return None
+        except Exception:
+            # If job context is unavailable, don't enable turn detection.
+            print("⚠️ turn_detection disabled: no job context / no inference executor")
+            return None
+
         from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
         # This model requires a LiveKit inference executor. In some local/dev setups
@@ -44,10 +79,6 @@ def maybe_turn_detection():
         #   "no inference executor"
         # We'll disable turn detection in that case and fall back to VAD behavior.
         m = MultilingualModel()
-        # Heuristic: if executor is missing, the runtime will error later.
-        if getattr(m, "_executor", None) is None:
-            print("⚠️ turn_detection disabled: no inference executor")
-            return None
         return m
     except Exception as e:
         print(f"⚠️ turn_detection disabled: {type(e).__name__}: {e}")
@@ -57,6 +88,144 @@ def maybe_turn_detection():
 def tts_speaker(md: dict) -> str:
     voice = (md.get("interviewer") or {}).get("voice") or "Female"
     return "abhilash" if voice == "Male" else "anushka"
+
+
+# ============================================================================
+# LLM (plug-and-play via DSPy)
+# ============================================================================
+
+def _llm_backend() -> str:
+    return (os.getenv("LLM_BACKEND") or "livekit").strip().lower()
+
+
+def _llm_model() -> str:
+    return (os.getenv("LLM_MODEL") or "gpt-4o-mini").strip()
+
+
+def _llm_temperature() -> float:
+    try:
+        return float(os.getenv("LLM_TEMPERATURE", "0.3"))
+    except Exception:
+        return 0.3
+
+
+def _dspy_provider() -> str:
+    # matches your sample naming: openai / claude / anthropic
+    return (os.getenv("DSPY_PROVIDER") or "openai").strip().lower()
+
+
+def _dspy_model_path(provider: str, model_name: str) -> str:
+    if provider in ("claude", "anthropic"):
+        return f"anthropic/{model_name}"
+    if provider == "openai":
+        return f"openai/{model_name}"
+    # If you want Azure or a custom backend, set DSPY_MODEL_PATH directly.
+    custom = (os.getenv("DSPY_MODEL_PATH") or "").strip()
+    if custom:
+        return custom
+    raise RuntimeError(f"Unsupported DSPY_PROVIDER={provider!r} (set DSPY_MODEL_PATH for custom providers)")
+
+
+def _chat_ctx_to_prompt(chat_ctx: lk_llm.ChatContext) -> str:
+    # Minimal prompt formatting: preserve roles and content.
+    parts: list[str] = []
+    for item in getattr(chat_ctx, "items", []) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        role = getattr(item, "role", None) or "user"
+        content_list = getattr(item, "content", None) or []
+        text = content_list[0] if isinstance(content_list, list) and content_list else ""
+        if isinstance(text, str) and text.strip():
+            parts.append(f"{role}: {text.strip()}")
+    parts.append("assistant:")
+    return "\n".join(parts).strip()
+
+
+class _DspyChatSignature:  # defined lazily inside _run to avoid importing dspy at import-time
+    pass
+
+
+class DspyLLMStream(lk_llm.LLMStream):
+    async def _run(self) -> None:
+        # Import only when used
+        try:
+            import dspy  # type: ignore
+        except Exception as e:
+            raise RuntimeError(f"DSPy is not installed: {type(e).__name__}: {e}") from e
+
+        prompt = _chat_ctx_to_prompt(self.chat_ctx)
+
+        provider = _dspy_provider()
+        model_name = _llm_model()
+        api_key = (os.getenv("DSPY_API_KEY") or "").strip() or None
+        if not api_key:
+            # Convenience: fall back to the same env var people already have.
+            api_key = (os.getenv("OPENAI_API_KEY") or "").strip() or None
+        if not api_key:
+            raise RuntimeError("Missing DSPY_API_KEY (or OPENAI_API_KEY) for DSPy LLM")
+
+        model_path = _dspy_model_path(provider, model_name)
+        temperature = _llm_temperature()
+
+        # Minimal DSPy signature: prompt -> response
+        class ChatSig(dspy.Signature):
+            prompt: str = dspy.InputField()
+            response: str = dspy.OutputField()
+
+        lm = dspy.LM(model_path, api_key=api_key, cache=False, temperature=temperature)
+        with dspy.context(lm=lm):
+            predictor = dspy.Predict(ChatSig)
+            pred = predictor(prompt=prompt)
+            text = (getattr(pred, "response", "") or "").strip()
+
+        # Emit a single delta chunk
+        chunk_id = f"dspy-{int(time.time() * 1000)}"
+        self._event_ch.send_nowait(
+            lk_llm.ChatChunk(
+                id=chunk_id,
+                delta=lk_llm.ChoiceDelta(role="assistant", content=text),
+            )
+        )
+
+
+class DspyLLM(lk_llm.LLM):
+    def __init__(self):
+        super().__init__()
+        self._model_name = _llm_model()
+        self._label = "dspy"
+
+    @property
+    def model(self) -> str:
+        return self._model_name or "unknown"
+
+    def chat(
+        self,
+        *,
+        chat_ctx: lk_llm.ChatContext,
+        tools=None,
+        conn_options=None,
+        parallel_tool_calls=None,
+        tool_choice=None,
+        extra_kwargs=None,
+    ) -> lk_llm.LLMStream:
+        # Tools are intentionally ignored for now (interview flow doesn't need function calling).
+        if conn_options is None:
+            conn_options = lk_llm.DEFAULT_API_CONNECT_OPTIONS
+        return DspyLLMStream(self, chat_ctx=chat_ctx, tools=tools or [], conn_options=conn_options)
+
+
+def create_llm(*, openai_plugin):
+    """
+    Factory:
+    - LLM_BACKEND=livekit (default): uses livekit.plugins.openai.LLM
+    - LLM_BACKEND=dspy: uses DSPy (set DSPY_PROVIDER, DSPY_API_KEY, LLM_MODEL)
+    """
+    backend = _llm_backend()
+    if backend == "dspy":
+        return DspyLLM()
+    if backend == "livekit":
+        return openai_plugin.LLM(model=_llm_model(), temperature=_llm_temperature())
+    raise RuntimeError(f"Unknown LLM_BACKEND={backend!r}")
 
 
 # ============================================================================

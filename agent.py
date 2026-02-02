@@ -19,10 +19,12 @@ from livekit.agents import Agent, AgentSession, RoomInputOptions
 from all_agent_functions import (
     build_instructions,
     build_welcome,
+    create_llm,
     create_tts,
     dedupe_text,
     download_turn_detector_files,
     maybe_turn_detection,
+    publish_playground_chat,
     post_transcript,
     require_env,
     tts_speaker,
@@ -84,11 +86,13 @@ class InterviewSession(AgentSession):
             "interviewerName": "Interviewer",
             "transcriptApiUrl": None,
         }
+        self._room_obj = None
         self._last_user = ("", 0)
         self._last_assistant = ("", 0)
 
     def set_ctx(self, ctx: dict):
         self._ctx.update(ctx or {})
+        self._room_obj = (ctx or {}).get("roomObj")
 
     def _dedupe(self, last: tuple[str, int], text: str) -> tuple[bool, tuple[str, int]]:
         return dedupe_text(last, text)
@@ -114,6 +118,8 @@ class InterviewSession(AgentSession):
             self._last_assistant = upd
             print(f"\n🎤 INTERVIEWER: {content}")
             asyncio.create_task(post_transcript(self._ctx, role="Interviewer", text=content))
+            if self._room_obj is not None:
+                publish_playground_chat(self._room_obj, content)
 
     # LiveKit Agents versions differ on which callback is invoked.
     def conversation_item_added(self, message):
@@ -161,10 +167,19 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception as e:
             print(f"❌ Failed to create TTS: {type(e).__name__}: {e}")
             return
+        if tts is None:
+            # If TTS is missing/disabled, LiveKit Playground will show "Waiting for agent audio track…".
+            # Make this explicit so it doesn't look like the agent is "disabled".
+            print(
+                "❌ TTS is not configured (no audio will be published). "
+                "Set SPEECHIFY_API_KEY (+ SPEECHIFY_VOICE_ID) or SARVAM_API_KEY, "
+                "or set TTS_PROVIDER=speechify|sarvam explicitly."
+            )
+            return
 
         session = InterviewSession(
             stt=deepgram.STT(model="nova-2", language="en"),
-            llm=openai.LLM(model="gpt-4o-mini", temperature=0.3),
+            llm=create_llm(openai_plugin=openai),
             tts=tts,
             vad=silero.VAD.load(),
             turn_detection=maybe_turn_detection(),
@@ -173,6 +188,7 @@ async def entrypoint(ctx: agents.JobContext):
         session.set_ctx(
             {
                 "room": getattr(ctx.room, "name", "") or "",
+                "roomObj": ctx.room,
                 "interviewId": md.get("interviewId"),
                 "transcriptRecordId": md.get("transcriptRecordId"),
                 "candidateName": (md.get("applicant") or {}).get("name") or "Candidate",
@@ -189,18 +205,19 @@ async def entrypoint(ctx: agents.JobContext):
         )
 
         # Wait until at least one participant (candidate) is present before speaking.
-        # Using the SDK helper + a simple identity check prevents starting when only non-candidate remotes exist.
+        # Important: the candidate may already be in the room by the time the agent starts,
+        # so we must check current presence before waiting for a "join" event.
         print("⏳ Waiting for candidate to join…")
         try:
             while True:
-                # Wait for *some* remote participant event.
-                await ctx.wait_for_participant()
                 remotes = getattr(ctx.room, "remote_participants", None) or {}
-                # Only start once a candidate joins (identity is minted as "candidate-...").
                 if any(getattr(p, "identity", "").startswith("candidate-") for p in remotes.values()):
                     break
+                try:
+                    await asyncio.wait_for(ctx.wait_for_participant(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    await asyncio.sleep(0.1)
         except asyncio.CancelledError:
-            # LiveKit can cancel jobs; log explicitly so it's not a silent "process exiting".
             print("⚠️ Job cancelled while waiting for candidate to join.")
             raise
 
@@ -208,9 +225,8 @@ async def entrypoint(ctx: agents.JobContext):
         try:
             await session.say(welcome)
         except Exception as e:
-            # If TTS is misconfigured / out of credits, keep the job alive (the room join still helps debugging).
             print(f"⚠️ welcome TTS failed: {type(e).__name__}: {e}")
-        # Ensure welcome is captured even if the SDK doesn't emit a conversation-item callback for TTS.
+        publish_playground_chat(ctx.room, welcome)
         asyncio.create_task(post_transcript(session._ctx, role="Interviewer", text=welcome))
 
         while True:

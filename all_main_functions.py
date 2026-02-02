@@ -23,6 +23,7 @@ from fastapi import HTTPException, Request
 from pypdf import PdfReader
 from livekit import api
 from livekit.api.twirp_client import TwirpError
+from livekit.protocol import agent as agent_proto
 from livekit.protocol import room as room_proto
 
 
@@ -278,18 +279,24 @@ async def ensure_agent_dispatched(lk: api.LiveKitAPI, *, room: str) -> api.Agent
     Avoid stacking duplicates.
     """
     agent_present = False
-    with suppress(Exception):
+    participants_known = False
+    try:
         lp = await lk.room.list_participants(api.ListParticipantsRequest(room=room))
+        participants_known = True
         participants = getattr(lp, "participants", None) or []
         agent_present = any(
             isinstance(getattr(p, "identity", None), str)
             and getattr(p, "identity")
-            and not str(getattr(p, "identity")).startswith("candidate-")
+            and str(getattr(p, "identity")).startswith("agent-")
             for p in participants
         )
+    except Exception:
+        # If we can't list participants, don't assume the agent is absent; avoid cancelling jobs.
+        participants_known = False
 
     existing_valid = None
     existing_status = None
+    existing_jobs: list | None = None
     try:
         dispatches = await lk.agent_dispatch.list_dispatch(room_name=room)
         for d in dispatches or []:
@@ -298,6 +305,7 @@ async def ensure_agent_dispatched(lk: api.LiveKitAPI, *, room: str) -> api.Agent
                 with suppress(Exception):
                     st = getattr(d, "state", None)
                     jobs = getattr(st, "jobs", None) or []
+                    existing_jobs = jobs
                     if jobs:
                         js = getattr(jobs[0], "state", None)
                         existing_status = getattr(js, "status", None)
@@ -318,6 +326,44 @@ async def ensure_agent_dispatched(lk: api.LiveKitAPI, *, room: str) -> api.Agent
             if isinstance(did, str) and did:
                 with suppress(Exception):
                     await lk.agent_dispatch.delete_dispatch(dispatch_id=did, room_name=room)
+            return await lk.agent_dispatch.create_dispatch(
+                api.CreateAgentDispatchRequest(room=room, agent_name=LIVEKIT_AGENT_NAME)
+            )
+
+        # If dispatch claims there is an active job but we can *confirm* no agent is in the room,
+        # it's very likely a stuck job (worker restarted/crashed). Recreate the dispatch.
+        #
+        # We ONLY do this when participant listing succeeded (`participants_known=True`) to avoid
+        # accidental duplicate dispatches when the presence check is unavailable.
+        if participants_known and (not agent_present) and isinstance(existing_status, int):
+            with suppress(Exception):
+                if agent_proto.JobStatus.Name(existing_status) == "JS_RUNNING":
+                    did = getattr(existing_valid, "id", None)
+                    if isinstance(did, str) and did:
+                        with suppress(Exception):
+                            await lk.agent_dispatch.delete_dispatch(dispatch_id=did, room_name=room)
+                    return await lk.agent_dispatch.create_dispatch(
+                        api.CreateAgentDispatchRequest(room=room, agent_name=LIVEKIT_AGENT_NAME)
+                    )
+
+        # If there is an existing dispatch with an active job/state, keep it (idempotent).
+        if existing_jobs is not None and len(existing_jobs) > 0:
+            return existing_valid
+
+        # No job attached yet. This can be "eventually consistent" for a moment, or it can be stale.
+        # If we can confirm the agent is not present, wait briefly for jobs to appear; otherwise recreate.
+        did = getattr(existing_valid, "id", None)
+        if isinstance(did, str) and did and participants_known:
+            for _ in range(5):
+                with suppress(Exception):
+                    d2 = await lk.agent_dispatch.get_dispatch(dispatch_id=did, room_name=room)
+                    st2 = getattr(d2, "state", None) if d2 is not None else None
+                    jobs2 = getattr(st2, "jobs", None) or []
+                    if jobs2:
+                        return existing_valid
+                await asyncio.sleep(0.2)
+            with suppress(Exception):
+                await lk.agent_dispatch.delete_dispatch(dispatch_id=did, room_name=room)
             return await lk.agent_dispatch.create_dispatch(
                 api.CreateAgentDispatchRequest(room=room, agent_name=LIVEKIT_AGENT_NAME)
             )
@@ -596,7 +642,7 @@ async def hrone_find_record_id_by_transcript_id(*, object_id: str, view_id: str,
     return None
 
 
-async def hrone_create_record(*, object_id: str, values: list[dict], access_token: str | None) -> None:
+async def hrone_create_record(*, object_id: str, values: list[dict], access_token: str | None) -> str:
     async with httpx.AsyncClient(timeout=15.0) as client:
         url = f"{HRONE_API}/objects/{object_id}/records"
         res = await client.post(
@@ -608,6 +654,19 @@ async def hrone_create_record(*, object_id: str, values: list[dict], access_toke
         if res.status_code not in (200, 201):
             print(f"⚠️ HROne create failed: POST {url} -> {res.status_code} {_short(res.text)}")
             raise HTTPException(res.status_code, f"HROne create failed: {res.text}")
+        try:
+            payload = res.json()
+        except Exception:
+            # If API doesn't return JSON, fall back to view lookup by transcriptId.
+            return ""
+        # Common shapes: {"data":{"id":"..."}} or {"id":"..."}
+        rid = None
+        if isinstance(payload, dict):
+            if isinstance(payload.get("id"), str):
+                rid = payload.get("id")
+            elif isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("id"), str):
+                rid = payload["data"].get("id")
+        return rid or ""
 
 
 async def hrone_get_record(*, object_id: str, record_id: str, access_token: str | None) -> dict | list | None:
@@ -715,9 +774,9 @@ async def handle_start_interview(*, interview_id: str, email: str, request: Requ
     if PUBLIC_API_URL:
         interview_data["transcriptApiUrl"] = f"{PUBLIC_API_URL.rstrip('/')}/api/transcript"
 
-    # Create transcript record only once per interviewId (per API process)
-    transcript_record_id = _TRANSCRIPT_RECORD_BY_INTERVIEW_ID.get(interview_id)
-    if TRANSCRIPTS_OBJECT_ID and not transcript_record_id:
+    # Always start from scratch: create a NEW transcript record on every start-interview call.
+    transcript_record_id = None
+    if TRANSCRIPTS_OBJECT_ID:
         transcript_id = uuid.uuid4().hex
         values: list[dict] = []
         if TRANSCRIPTS_PROP_ID_TRANSCRIPT_ID and TRANSCRIPTS_FIELD_TRANSCRIPT_ID:
@@ -735,8 +794,8 @@ async def handle_start_interview(*, interview_id: str, email: str, request: Requ
         else:
             values.append({"key": TRANSCRIPTS_FIELD_TRANSCRIPT_JSON, "value": []})
 
-        await hrone_create_record(object_id=TRANSCRIPTS_OBJECT_ID, values=values, access_token=hrone_token)
-        transcript_record_id = None
+        created_id = await hrone_create_record(object_id=TRANSCRIPTS_OBJECT_ID, values=values, access_token=hrone_token)
+        transcript_record_id = created_id or None
         if TRANSCRIPTS_VIEW_ID:
             transcript_record_id = await hrone_find_record_id_by_transcript_id(
                 object_id=TRANSCRIPTS_OBJECT_ID,
@@ -746,6 +805,7 @@ async def handle_start_interview(*, interview_id: str, email: str, request: Requ
             )
 
     if transcript_record_id:
+        # overwrite cache so /api/transcript can still work even if transcriptRecordId isn't sent
         _TRANSCRIPT_RECORD_BY_INTERVIEW_ID[interview_id] = transcript_record_id
         interview_data["transcriptRecordId"] = transcript_record_id
         if hrone_token:
@@ -753,7 +813,9 @@ async def handle_start_interview(*, interview_id: str, email: str, request: Requ
 
     # LiveKit room + dispatch
     room = f"interview-{interview_id}"
-    identity = f"candidate-{applicant_id}-{uuid.uuid4().hex[:8]}"
+    # Use a stable identity per applicant so reconnects (or repeated /api/start-interview calls)
+    # don't create a brand-new participant identity each time.
+    identity = f"candidate-{applicant_id}"
 
     token = (
         api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
@@ -789,7 +851,7 @@ async def handle_start_interview(*, interview_id: str, email: str, request: Requ
                 agent_joined = any(
                     isinstance(getattr(p, "identity", None), str)
                     and getattr(p, "identity")
-                    and not getattr(p, "identity").startswith("candidate-")
+                    and getattr(p, "identity").startswith("agent-")
                     for p in participants
                 )
                 if agent_joined:
@@ -805,15 +867,14 @@ async def handle_start_interview(*, interview_id: str, email: str, request: Requ
             agent_present_now = any(
                 isinstance(getattr(p, "identity", None), str)
                 and getattr(p, "identity")
-                and not getattr(p, "identity").startswith("candidate-")
+                and getattr(p, "identity").startswith("agent-")
                 for p in participants2
             )
         except Exception:
-            agent_present_now = agent_joined
+            # Don't claim presence if we couldn't verify it.
+            agent_present_now = False
 
-        # Helpful debug fields: which worker LiveKit assigned this dispatch to (if any).
-        # Note: CreateDispatch can return before the state is populated. Poll briefly using get_dispatch().
-        dispatch_state_str = str(getattr(dispatch, "state", "") or "")
+        # Helpful debug fields from dispatch/job state (note: dispatch state is eventually consistent).
         try:
             did = getattr(dispatch, "id", None)
             if isinstance(did, str) and did:
@@ -822,20 +883,23 @@ async def handle_start_interview(*, interview_id: str, email: str, request: Requ
                     if d2 is None:
                         await asyncio.sleep(0.25)
                         continue
-                    dispatch_state_str = str(getattr(d2, "state", "") or "")
-                    if dispatch_state_str:
+                    st = getattr(d2, "state", None)
+                    jobs = getattr(st, "jobs", None) or []
+                    if jobs:
+                        js = getattr(jobs[0], "state", None)
+                        status = getattr(js, "status", None)
+                        if isinstance(status, int):
+                            dispatch_status = agent_proto.JobStatus.Name(status)
+                        elif status is not None:
+                            dispatch_status = str(status)
+                        agent_participant_identity = getattr(js, "participant_identity", None) or agent_participant_identity
                         break
                     await asyncio.sleep(0.25)
         except Exception:
             pass
 
-        if dispatch_state_str:
-            m = re.search(r'worker_id:\s*"([^"]+)"', dispatch_state_str)
-            assigned_worker_id = m.group(1) if m else None
-            m = re.search(r'participant_identity:\s*"([^"]+)"', dispatch_state_str)
-            agent_participant_identity = m.group(1) if m else None
-            m = re.search(r'status:\s*(JS_[A-Z_]+)', dispatch_state_str)
-            dispatch_status = m.group(1) if m else None
+        # worker_id is not available in the protocol we're using; keep it for debug compatibility.
+        assigned_worker_id = None
     finally:
         await lk.aclose()
 
@@ -863,7 +927,7 @@ async def handle_start_interview(*, interview_id: str, email: str, request: Requ
         "agentParticipantIdentity": agent_participant_identity,
         "dispatchStatus": dispatch_status,
         "agentPresentNow": agent_present_now,
-        "resumed": True,
+        "resumed": False,
         "interview_data": interview_data,
     }
 
