@@ -60,21 +60,31 @@ class TranscriptRequest(BaseModel):
 
 @app.post("/api/start-interview")
 async def api_start_interview(req: StartInterviewRequest, request: Request):
-    return await handle_start_interview(interview_id=req.interviewId, email=req.email, request=request)
+    try:
+        return await handle_start_interview(interview_id=req.interviewId, email=req.email, request=request)
+    except Exception as e:
+        # Keep API stable; just log which call failed.
+        print(f"⚠️ /api/start-interview failed: {type(e).__name__}: {e}")
+        return {"success": False, "reason": "start-interview failed"}
 
 
 @app.post("/api/transcript")
 async def api_transcript(req: TranscriptRequest, request: Request):
-    return await handle_transcript(
-        request=request,
-        interview_id=req.interviewId,
-        role=req.role,
-        speaker_name=req.speakerName,
-        text=req.text,
-        timestamp_ms=req.timestampMs,
-        room=req.room,
-        transcript_record_id=req.transcriptRecordId,
-    )
+    try:
+        return await handle_transcript(
+            request=request,
+            interview_id=req.interviewId,
+            role=req.role,
+            speaker_name=req.speakerName,
+            text=req.text,
+            timestamp_ms=req.timestampMs,
+            room=req.room,
+            transcript_record_id=req.transcriptRecordId,
+        )
+    except Exception as e:
+        # Keep API stable; just log which call failed.
+        print(f"⚠️ /api/transcript failed: {type(e).__name__}: {e}")
+        return {"success": False, "reason": "transcript failed"}
 
 
 if __name__ == "__main__":

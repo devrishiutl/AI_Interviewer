@@ -19,6 +19,7 @@ from livekit.agents import Agent, AgentSession, RoomInputOptions
 from all_agent_functions import (
     build_instructions,
     build_welcome,
+    create_tts,
     dedupe_text,
     download_turn_detector_files,
     maybe_turn_detection,
@@ -118,18 +119,13 @@ class InterviewSession(AgentSession):
     def conversation_item_added(self, message):
         return self._conversation_item_added(message)
 
-    def on_conversation_item_added(self, message):
-        return self._conversation_item_added(message)
+    # def on_conversation_item_added(self, message):
+    #     return self._conversation_item_added(message)
 
 
 async def entrypoint(ctx: agents.JobContext):
     try:
         print("🎯 Agent job received; starting…")
-        sarvam_key = os.getenv("SARVAM_API_KEY")
-        if not sarvam_key:
-            print("❌ SARVAM_API_KEY missing (agent will not join)")
-            return
-
         # Plugins are imported/registered during process prewarm on the main thread (see prewarm()).
         deepgram = _PLUGINS["deepgram"]
         noise_cancellation = _PLUGINS["noise_cancellation"]
@@ -160,15 +156,16 @@ async def entrypoint(ctx: agents.JobContext):
             print("❌ Missing required metadata (applicant/job)")
             return
 
+        try:
+            tts = create_tts(md=md, sarvam_plugin=sarvam)
+        except Exception as e:
+            print(f"❌ Failed to create TTS: {type(e).__name__}: {e}")
+            return
+
         session = InterviewSession(
             stt=deepgram.STT(model="nova-2", language="en"),
             llm=openai.LLM(model="gpt-4o-mini", temperature=0.3),
-            tts=sarvam.TTS(
-                target_language_code="en-IN",
-                model="bulbul:v2",
-                speaker=tts_speaker(md),
-                api_key=sarvam_key,
-            ),
+            tts=tts,
             vad=silero.VAD.load(),
             turn_detection=maybe_turn_detection(),
         )
@@ -191,17 +188,21 @@ async def entrypoint(ctx: agents.JobContext):
             room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC(), close_on_disconnect=False),
         )
 
-        # Wait until at least one remote participant (candidate) is present before speaking.
-        # Otherwise the "interview starts" with only the agent in the room.
+        # Wait until at least one participant (candidate) is present before speaking.
+        # Using the SDK helper + a simple identity check prevents starting when only non-candidate remotes exist.
         print("⏳ Waiting for candidate to join…")
-        while True:
-            try:
+        try:
+            while True:
+                # Wait for *some* remote participant event.
+                await ctx.wait_for_participant()
                 remotes = getattr(ctx.room, "remote_participants", None) or {}
-                if len(remotes) > 0:
+                # Only start once a candidate joins (identity is minted as "candidate-...").
+                if any(getattr(p, "identity", "").startswith("candidate-") for p in remotes.values()):
                     break
-            except Exception:
-                pass
-            await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            # LiveKit can cancel jobs; log explicitly so it's not a silent "process exiting".
+            print("⚠️ Job cancelled while waiting for candidate to join.")
+            raise
 
         welcome = build_welcome(md)
         try:

@@ -12,6 +12,7 @@ import os
 import re
 import time
 import uuid
+from contextlib import suppress
 from datetime import timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -62,20 +63,17 @@ def _room_metadata_json(interview_data: dict) -> str:
         return json.dumps(md, ensure_ascii=False)
 
     # First: truncate common large fields.
-    try:
-        app = md.get("applicant") or {}
-        if isinstance(app, dict) and "resumeText" in app:
-            app["resumeText"] = _trim_text(app.get("resumeText"), max_len=2000)
-        job = md.get("job") or {}
-        if isinstance(job, dict) and "description" in job:
-            job["description"] = _trim_text(job.get("description"), max_len=2000)
-        rnd = md.get("round") or {}
-        if isinstance(rnd, dict) and "instructions" in rnd:
-            rnd["instructions"] = _trim_text(rnd.get("instructions"), max_len=1500)
-        if isinstance(rnd, dict) and isinstance(rnd.get("questions"), list) and len(rnd["questions"]) > 30:
-            rnd["questions"] = rnd["questions"][:30]
-    except Exception:
-        pass
+    app = md.get("applicant") or {}
+    if isinstance(app, dict) and "resumeText" in app:
+        app["resumeText"] = _trim_text(app.get("resumeText"), max_len=2000)
+    job = md.get("job") or {}
+    if isinstance(job, dict) and "description" in job:
+        job["description"] = _trim_text(job.get("description"), max_len=2000)
+    rnd = md.get("round") or {}
+    if isinstance(rnd, dict) and "instructions" in rnd:
+        rnd["instructions"] = _trim_text(rnd.get("instructions"), max_len=1500)
+    if isinstance(rnd, dict) and isinstance(rnd.get("questions"), list) and len(rnd["questions"]) > 30:
+        rnd["questions"] = rnd["questions"][:30]
 
     if _size() <= _ROOM_METADATA_MAX_BYTES:
         return _dump()
@@ -131,10 +129,13 @@ async def _cleanup_legacy_numeric_rooms(lk: api.LiveKitAPI, *, keep_room: str) -
 
     We no longer support that flow, so delete legacy numeric rooms + their dispatches.
     """
-    try:
+    with suppress(Exception):
         lr = await lk.room.list_rooms(api.ListRoomsRequest())
         rooms = getattr(lr, "rooms", None) or []
-    except Exception:
+        # proceed to cleanup below
+        pass
+    # if list_rooms failed
+    if "rooms" not in locals():
         return
 
     for r in rooms:
@@ -145,36 +146,26 @@ async def _cleanup_legacy_numeric_rooms(lk: api.LiveKitAPI, *, keep_room: str) -
             continue
 
         # Delete dispatches for that room.
-        try:
+        with suppress(Exception):
             existing = await lk.agent_dispatch.list_dispatch(room_name=name)
             for d in existing or []:
                 did = getattr(d, "id", None)
                 if isinstance(did, str) and did:
-                    try:
+                    with suppress(Exception):
                         await lk.agent_dispatch.delete_dispatch(dispatch_id=did, room_name=name)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
 
         # Kick participants, then delete room.
-        try:
+        with suppress(Exception):
             lp = await lk.room.list_participants(api.ListParticipantsRequest(room=name))
             participants = getattr(lp, "participants", None) or []
             for p in participants:
                 ident = getattr(p, "identity", None)
                 if isinstance(ident, str) and ident:
-                    try:
+                    with suppress(Exception):
                         await lk.room.remove_participant(room_proto.RoomParticipantIdentity(room=name, identity=ident))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
 
-        try:
+        with suppress(Exception):
             await lk.room.delete_room(api.DeleteRoomRequest(room=name))
-        except Exception:
-            pass
 
 
 # -----------------------------------------------------------------------------
@@ -286,7 +277,8 @@ async def ensure_agent_dispatched(lk: api.LiveKitAPI, *, room: str) -> api.Agent
     Ensure there's an agent in the room (or at least a valid dispatch queued).
     Avoid stacking duplicates.
     """
-    try:
+    agent_present = False
+    with suppress(Exception):
         lp = await lk.room.list_participants(api.ListParticipantsRequest(room=room))
         participants = getattr(lp, "participants", None) or []
         agent_present = any(
@@ -295,8 +287,6 @@ async def ensure_agent_dispatched(lk: api.LiveKitAPI, *, room: str) -> api.Agent
             and not str(getattr(p, "identity")).startswith("candidate-")
             for p in participants
         )
-    except Exception:
-        agent_present = False
 
     existing_valid = None
     existing_status = None
@@ -305,20 +295,16 @@ async def ensure_agent_dispatched(lk: api.LiveKitAPI, *, room: str) -> api.Agent
         for d in dispatches or []:
             if getattr(d, "room", None) == room and getattr(d, "agent_name", None) == LIVEKIT_AGENT_NAME:
                 existing_valid = d
-                try:
+                with suppress(Exception):
                     st = getattr(d, "state", None)
                     jobs = getattr(st, "jobs", None) or []
                     if jobs:
                         js = getattr(jobs[0], "state", None)
                         existing_status = getattr(js, "status", None)
-                except Exception:
-                    pass
                 break
     except TwirpError as e:
         if getattr(e, "code", None) != "not_found":
             raise
-    except Exception:
-        pass
 
     if agent_present:
         return existing_valid or await lk.agent_dispatch.create_dispatch(
@@ -328,12 +314,10 @@ async def ensure_agent_dispatched(lk: api.LiveKitAPI, *, room: str) -> api.Agent
     if existing_valid is not None:
         # Re-dispatch if terminal.
         if existing_status in (2, 3):  # JS_SUCCESS=2, JS_FAILED=3
-            try:
-                did = getattr(existing_valid, "id", None)
-                if isinstance(did, str) and did:
+            did = getattr(existing_valid, "id", None)
+            if isinstance(did, str) and did:
+                with suppress(Exception):
                     await lk.agent_dispatch.delete_dispatch(dispatch_id=did, room_name=room)
-            except Exception:
-                pass
             return await lk.agent_dispatch.create_dispatch(
                 api.CreateAgentDispatchRequest(room=room, agent_name=LIVEKIT_AGENT_NAME)
             )

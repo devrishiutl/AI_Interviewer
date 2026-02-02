@@ -8,6 +8,7 @@ except Exception:
 import os
 import re
 import time
+import base64
 
 import httpx
 
@@ -38,7 +39,16 @@ def maybe_turn_detection():
     try:
         from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-        return MultilingualModel()
+        # This model requires a LiveKit inference executor. In some local/dev setups
+        # (or missing inference runtime), it spams:
+        #   "no inference executor"
+        # We'll disable turn detection in that case and fall back to VAD behavior.
+        m = MultilingualModel()
+        # Heuristic: if executor is missing, the runtime will error later.
+        if getattr(m, "_executor", None) is None:
+            print("⚠️ turn_detection disabled: no inference executor")
+            return None
+        return m
     except Exception as e:
         print(f"⚠️ turn_detection disabled: {type(e).__name__}: {e}")
         return None
@@ -47,6 +57,149 @@ def maybe_turn_detection():
 def tts_speaker(md: dict) -> str:
     voice = (md.get("interviewer") or {}).get("voice") or "Female"
     return "abhilash" if voice == "Male" else "anushka"
+
+
+# ============================================================================
+# TTS (plug-and-play)
+# ============================================================================
+
+def select_tts_provider() -> str | None:
+    """
+    Choose TTS provider.
+
+    - If TTS_PROVIDER is set, it must be one of: speechify | sarvam | none
+    - Else: SPEECHIFY_API_KEY -> speechify
+    - Else: SARVAM_API_KEY -> sarvam
+    """
+    p = (os.getenv("TTS_PROVIDER") or "").strip().lower()
+    if p in ("none", "off", "0", "false"):
+        return None
+    if p:
+        return p
+    if os.getenv("SPEECHIFY_API_KEY"):
+        return "speechify"
+    if os.getenv("SARVAM_API_KEY"):
+        return "sarvam"
+    return None
+
+
+def _speechify_base_url() -> str:
+    return (os.getenv("SPEECHIFY_BASE_URL") or "https://api.sws.speechify.com").rstrip("/")
+
+
+from livekit.agents import tts as lk_tts
+
+
+class SpeechifyTTS(lk_tts.TTS):
+    """
+    Minimal Speechify TTS adapter for LiveKit Agents.
+
+    Uses the Speechify AI API with API key auth:
+      Authorization: Bearer <SPEECHIFY_API_KEY>
+    """
+
+    def __init__(self, *, api_key: str, voice_id: str, output_format: str | None = None):
+        super().__init__(
+            capabilities=lk_tts.TTSCapabilities(streaming=False, aligned_transcript=False),
+            sample_rate=24000,
+            num_channels=1,
+        )
+        self._api_key = api_key.strip()
+        self._voice_id = voice_id.strip()
+        self._output_format = (output_format or "").strip().lower() or None
+
+    def synthesize(self, text: str, *, conn_options=None):
+        if conn_options is None:
+            conn_options = lk_tts.DEFAULT_API_CONNECT_OPTIONS
+
+        api_key, voice_id, output_format = self._api_key, self._voice_id, self._output_format
+
+        class _SpeechifyChunkedStream(lk_tts.ChunkedStream):
+            async def _run(self, output_emitter):
+                url = f"{_speechify_base_url()}/v1/audio/speech"
+                headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+                payload = {"input": text, "voice_id": voice_id}
+                if output_format:
+                    payload["audio_format"] = output_format
+
+                async with httpx.AsyncClient(timeout=conn_options.timeout) as client:
+                    r = await client.post(url, headers=headers, json=payload)
+                    ct = (r.headers.get("content-type") or "").lower()
+                    if r.status_code >= 300:
+                        body = (r.text or "").strip()
+                        raise RuntimeError(f"Speechify TTS failed {r.status_code}: {body[:1000]}")
+
+                    request_id = r.headers.get("x-request-id") or r.headers.get("x-requestid") or "speechify"
+                    mime_type = "audio/mpeg"
+                    audio_bytes = None
+
+                    # Some Speechify setups can return raw audio; docs show JSON with base64 `audio_data`.
+                    if ct.startswith("audio/"):
+                        audio_bytes = r.content
+                        mime_type = ct.split(";", 1)[0].strip() or mime_type
+                    else:
+                        data = r.json() if r.content else {}
+                        audio_b64 = (data.get("audio_data") or data.get("audioData")) if isinstance(data, dict) else None
+                        if isinstance(audio_b64, str) and audio_b64.strip():
+                            audio_bytes = base64.b64decode(audio_b64)
+                            fmt = (data.get("audio_format") or data.get("audioFormat") or "").strip().lower()
+                            if fmt == "wav":
+                                mime_type = "audio/wav"
+
+                    if not audio_bytes:
+                        body = (r.text or "").strip()
+                        raise RuntimeError(f"Speechify TTS returned no audio bytes (status={r.status_code}, ct={ct}, body={body[:1000]})")
+
+                    output_emitter.initialize(
+                        request_id=request_id,
+                        # livekit.agents stores TTS on the stream instance as `_tts`
+                        sample_rate=self._tts.sample_rate,
+                        num_channels=self._tts.num_channels,
+                        mime_type=mime_type,
+                        stream=False,
+                    )
+                    output_emitter.push(audio_bytes)
+                    output_emitter.flush()
+
+        return _SpeechifyChunkedStream(tts=self, input_text=text, conn_options=conn_options)
+
+
+def create_tts(*, md: dict, sarvam_plugin=None):
+    """
+    Factory:
+    - speechify: uses SPEECHIFY_API_KEY (direct HTTP integration, no plugin install needed)
+    - sarvam: uses existing livekit-plugins-sarvam (kept as-is)
+    """
+    provider = select_tts_provider()
+    if not provider:
+        return None
+
+    if provider == "speechify":
+        key = os.getenv("SPEECHIFY_API_KEY")
+        if not key:
+            raise RuntimeError("TTS_PROVIDER=speechify but SPEECHIFY_API_KEY is missing")
+        voice_id = (os.getenv("SPEECHIFY_VOICE_ID") or "").strip()
+        if not voice_id:
+            raise RuntimeError(
+                "Speechify TTS requires a voice_id. Set SPEECHIFY_VOICE_ID from Speechify Playground/Console."
+            )
+        fmt = (os.getenv("SPEECHIFY_FORMAT") or "").strip().lower()
+        return SpeechifyTTS(api_key=key, voice_id=voice_id, output_format=fmt or None)
+
+    if provider == "sarvam":
+        key = os.getenv("SARVAM_API_KEY")
+        if not key:
+            raise RuntimeError("TTS_PROVIDER=sarvam but SARVAM_API_KEY is missing")
+        if sarvam_plugin is None:
+            raise RuntimeError("Sarvam plugin not loaded")
+        return sarvam_plugin.TTS(
+            target_language_code="en-IN",
+            model="bulbul:v2",
+            speaker=tts_speaker(md),
+            api_key=key,
+        )
+
+    raise RuntimeError(f"Unknown TTS_PROVIDER={provider!r}")
 
 
 def _norm_text(s: str) -> str:
