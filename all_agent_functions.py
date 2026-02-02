@@ -119,7 +119,11 @@ def _dspy_model_path(provider: str, model_name: str) -> str:
         return f"anthropic/{model_name}"
     if provider == "openai":
         return f"openai/{model_name}"
-    # If you want Azure or a custom backend, set DSPY_MODEL_PATH directly.
+    if provider == "azure":
+        # Azure OpenAI: LiteLLM expects just "azure/<deployment_name>"
+        # The endpoint/version are set via environment variables (see _run)
+        return f"azure/{model_name}"
+    # If you want a custom backend, set DSPY_MODEL_PATH directly.
     custom = (os.getenv("DSPY_MODEL_PATH") or "").strip()
     if custom:
         return custom
@@ -166,6 +170,17 @@ class DspyLLMStream(lk_llm.LLMStream):
 
         model_path = _dspy_model_path(provider, model_name)
         temperature = _llm_temperature()
+
+        # For Azure, set environment variables that LiteLLM expects
+        if provider == "azure":
+            api_base = (os.getenv("AZURE_OPENAI_API_BASE") or "").strip()
+            api_version = (os.getenv("AZURE_OPENAI_API_VERSION") or "2025-01-01-preview").strip()
+            if not api_base:
+                raise RuntimeError("AZURE_OPENAI_API_BASE is required when DSPY_PROVIDER=azure")
+            # Temporarily set env vars for LiteLLM to pick up
+            os.environ["AZURE_OPENAI_ENDPOINT"] = api_base
+            os.environ["AZURE_OPENAI_API_VERSION"] = api_version
+            os.environ["AZURE_OPENAI_API_KEY"] = api_key
 
         # Minimal DSPy signature: prompt -> response
         class ChatSig(dspy.Signature):
