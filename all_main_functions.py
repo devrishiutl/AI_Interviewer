@@ -215,6 +215,18 @@ TRANSCRIPTS_PROP_ID_SPEAKER_NAME = os.getenv("HRONE_TRANSCRIPTS_PROP_ID_SPEAKER_
 TRANSCRIPTS_PROP_ID_TEXT = os.getenv("HRONE_TRANSCRIPTS_PROP_ID_TEXT", "")
 TRANSCRIPTS_PROP_ID_TIMESTAMP = os.getenv("HRONE_TRANSCRIPTS_PROP_ID_TIMESTAMP", "")
 
+# Feedback table
+FEEDBACK_OBJECT_ID = os.getenv("HRONE_FEEDBACK_OBJECT_ID", "")
+FEEDBACK_FIELD_INTERVIEW_ID = os.getenv("HRONE_FEEDBACK_FIELD_INTERVIEW_ID", "interviewId")
+FEEDBACK_FIELD_EXPERIENCE = os.getenv("HRONE_FEEDBACK_FIELD_EXPERIENCE", "experience")
+FEEDBACK_FIELD_RATING = os.getenv("HRONE_FEEDBACK_FIELD_RATING", "rating")
+FEEDBACK_FIELD_TIMESTAMP = os.getenv("HRONE_FEEDBACK_FIELD_TIMESTAMP", "timestamp")
+
+FEEDBACK_PROP_ID_INTERVIEW_ID = os.getenv("HRONE_FEEDBACK_PROP_ID_INTERVIEW_ID", "")
+FEEDBACK_PROP_ID_EXPERIENCE = os.getenv("HRONE_FEEDBACK_PROP_ID_EXPERIENCE", "")
+FEEDBACK_PROP_ID_RATING = os.getenv("HRONE_FEEDBACK_PROP_ID_RATING", "")
+FEEDBACK_PROP_ID_TIMESTAMP = os.getenv("HRONE_FEEDBACK_PROP_ID_TIMESTAMP", "")
+
 # Interviews table
 INTERVIEWS_OBJECT_ID = _require_env("HRONE_INTERVIEWS_OBJECT_ID")
 
@@ -977,4 +989,62 @@ async def handle_transcript(
         return {"success": True}
     except HTTPException as e:
         print(f"⚠️ transcript update failed: {e.detail}")
+        return {"success": False, "reason": str(e.detail)}
+
+
+async def handle_feedback(
+    *,
+    request: Request,
+    interview_id: str,
+    experience: str,
+    rating: int,
+) -> dict:
+    """Create a feedback record in HROne for the interview."""
+    if not FEEDBACK_OBJECT_ID:
+        return {"success": False, "reason": "HRONE_FEEDBACK_OBJECT_ID not configured"}
+
+    # Get HROne token from request
+    hrone_token = _extract_access_token(request)
+
+    # Validate rating (typically 1-5 or 1-10)
+    if not isinstance(rating, int) or rating < 1 or rating > 10:
+        return {"success": False, "reason": "rating must be between 1 and 10"}
+
+    # Validate experience text
+    if not isinstance(experience, str) or not experience.strip():
+        return {"success": False, "reason": "experience text is required"}
+
+    # Prepare values for HROne record
+    timestamp_ms = int(time.time() * 1000)
+    values: list[dict] = []
+
+    # Add interviewId
+    if FEEDBACK_PROP_ID_INTERVIEW_ID:
+        values.append({"propertyId": FEEDBACK_PROP_ID_INTERVIEW_ID, "key": FEEDBACK_FIELD_INTERVIEW_ID, "value": interview_id})
+    else:
+        values.append({"key": FEEDBACK_FIELD_INTERVIEW_ID, "value": interview_id})
+
+    # Add experience
+    if FEEDBACK_PROP_ID_EXPERIENCE:
+        values.append({"propertyId": FEEDBACK_PROP_ID_EXPERIENCE, "key": FEEDBACK_FIELD_EXPERIENCE, "value": experience.strip()})
+    else:
+        values.append({"key": FEEDBACK_FIELD_EXPERIENCE, "value": experience.strip()})
+
+    # Add rating
+    if FEEDBACK_PROP_ID_RATING:
+        values.append({"propertyId": FEEDBACK_PROP_ID_RATING, "key": FEEDBACK_FIELD_RATING, "value": rating})
+    else:
+        values.append({"key": FEEDBACK_FIELD_RATING, "value": rating})
+
+    # Add timestamp
+    if FEEDBACK_PROP_ID_TIMESTAMP:
+        values.append({"propertyId": FEEDBACK_PROP_ID_TIMESTAMP, "key": FEEDBACK_FIELD_TIMESTAMP, "value": timestamp_ms})
+    else:
+        values.append({"key": FEEDBACK_FIELD_TIMESTAMP, "value": timestamp_ms})
+
+    try:
+        record_id = await hrone_create_record(object_id=FEEDBACK_OBJECT_ID, values=values, access_token=hrone_token)
+        return {"success": True, "feedbackRecordId": record_id}
+    except HTTPException as e:
+        print(f"⚠️ feedback creation failed: {e.detail}")
         return {"success": False, "reason": str(e.detail)}

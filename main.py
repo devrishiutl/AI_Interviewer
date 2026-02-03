@@ -14,7 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from all_main_functions import handle_start_interview, handle_transcript
+from all_main_functions import handle_start_interview, handle_transcript, handle_feedback
 
 
 app = FastAPI(title="AI Interview Bot API")
@@ -53,6 +53,12 @@ class TranscriptRequest(BaseModel):
     transcriptRecordId: str | None = None
 
 
+class FeedbackRequest(BaseModel):
+    interviewId: str
+    experience: str  # "How was your experience with AI interviewer?"
+    rating: int  # "Rate AI interviewer" (e.g., 1-5 or 1-10)
+
+
 # -----------------------------------------------------------------------------
 # APIs
 # -----------------------------------------------------------------------------
@@ -85,6 +91,21 @@ async def api_transcript(req: TranscriptRequest, request: Request):
         # Keep API stable; just log which call failed.
         print(f"⚠️ /api/transcript failed: {type(e).__name__}: {e}")
         return {"success": False, "reason": "transcript failed"}
+
+
+@app.post("/api/feedback")
+async def api_feedback(req: FeedbackRequest, request: Request):
+    try:
+        return await handle_feedback(
+            request=request,
+            interview_id=req.interviewId,
+            experience=req.experience,
+            rating=req.rating,
+        )
+    except Exception as e:
+        # Keep API stable; just log which call failed.
+        print(f"⚠️ /api/feedback failed: {type(e).__name__}: {e}")
+        return {"success": False, "reason": "feedback failed"}
 
 
 if __name__ == "__main__":
