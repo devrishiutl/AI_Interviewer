@@ -109,24 +109,48 @@ class InterviewSession(AgentSession):
             if dup:
                 return
             self._last_user = upd
-            print(f"\n👤 CANDIDATE: {content}")
             asyncio.create_task(post_transcript(self._ctx, role="Candidate", text=content))
+            # Publish candidate message to data channel with sender info
+            if self._room_obj:
+                # Include sender info so frontend can identify candidate messages
+                import json
+                msg_data = json.dumps({"role": "candidate", "text": content})
+                publish_playground_chat(self._room_obj, msg_data)
         elif message.role == "assistant":
             dup, upd = self._dedupe(self._last_assistant, content)
             if dup:
                 return
             self._last_assistant = upd
-            print(f"\n🎤 INTERVIEWER: {content}")
             asyncio.create_task(post_transcript(self._ctx, role="Interviewer", text=content))
-            if self._room_obj is not None:
-                publish_playground_chat(self._room_obj, content)
+            # Publish interviewer message to data channel with sender info
+            if self._room_obj:
+                import json
+                msg_data = json.dumps({"role": "interviewer", "text": content})
+                publish_playground_chat(self._room_obj, msg_data)
 
-    # LiveKit Agents versions differ on which callback is invoked.
     def conversation_item_added(self, message):
         return self._conversation_item_added(message)
 
     # def on_conversation_item_added(self, message):
     #     return self._conversation_item_added(message)
+
+
+async def _wait_for_metadata(ctx: agents.JobContext) -> None:
+    """Wait for room metadata to arrive."""
+    while not ctx.room.metadata:
+        await asyncio.sleep(0.25)
+
+
+async def _wait_for_candidate(ctx: agents.JobContext) -> None:
+    """Wait for candidate to join using simple polling."""
+    while True:
+        try:
+            remotes = getattr(ctx.room, "remote_participants", None) or {}
+            if any(getattr(p, "identity", "").startswith("candidate-") for p in remotes.values()):
+                return
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
 
 
 async def entrypoint(ctx: agents.JobContext):
@@ -142,14 +166,11 @@ async def entrypoint(ctx: agents.JobContext):
             raise RuntimeError("LiveKit plugins not loaded. Did prewarm() fail?")
 
         await ctx.connect()
-        print(f"✅ Connected to room: {getattr(ctx.room, 'name', '')}")
 
-        # Metadata can arrive slightly after connect.
-        for _ in range(20):
-            if ctx.room.metadata:
-                break
-            await asyncio.sleep(0.25)
-        if not ctx.room.metadata:
+        # Wait for metadata with timeout
+        try:
+            await asyncio.wait_for(_wait_for_metadata(ctx), timeout=5.0)
+        except asyncio.TimeoutError:
             print("❌ No room metadata (start interview via /api/start-interview)")
             return
 
@@ -201,24 +222,17 @@ async def entrypoint(ctx: agents.JobContext):
             room=ctx.room,
             agent=InterviewerAgent(instructions=build_instructions(md)),
             # Keep agent running even if the browser disconnects/reconnects.
-            room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC(), close_on_disconnect=False),
+            # Note: RoomInputOptions is deprecated but still works in current version
+            room_input_options=RoomInputOptions(
+                noise_cancellation=noise_cancellation.BVC(),
+                close_on_disconnect=False
+            ),
         )
 
-        # Wait until at least one participant (candidate) is present before speaking.
-        # Important: the candidate may already be in the room by the time the agent starts,
-        # so we must check current presence before waiting for a "join" event.
-        print("⏳ Waiting for candidate to join…")
+        # Wait for candidate
         try:
-            while True:
-                remotes = getattr(ctx.room, "remote_participants", None) or {}
-                if any(getattr(p, "identity", "").startswith("candidate-") for p in remotes.values()):
-                    break
-                try:
-                    await asyncio.wait_for(ctx.wait_for_participant(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    await asyncio.sleep(0.1)
-        except asyncio.CancelledError:
-            print("⚠️ Job cancelled while waiting for candidate to join.")
+            await asyncio.wait_for(_wait_for_candidate(ctx), timeout=60.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
             raise
 
         welcome = build_welcome(md)

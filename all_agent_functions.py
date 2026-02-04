@@ -27,9 +27,11 @@ def publish_playground_chat(room, text: str, *, topic: str = "lk-chat") -> None:
         return
     # Most LiveKit UIs listen on "lk-chat"; also send on "chat" for compatibility.
     try:
-        asyncio.create_task(lp.publish_data(text, topic=topic, reliable=True))
-        if topic != "chat":
-            asyncio.create_task(lp.publish_data(text, topic="chat", reliable=True))
+        # asyncio.create_task(lp.publish_data(text, topic=topic, reliable=True))
+        # if topic != "chat":
+        #     asyncio.create_task(lp.publish_data(text, topic="chat", reliable=True))
+        asyncio.create_task(lp.publish_data(text.encode(), topic="chat", reliable=True))
+
     except RuntimeError:
         # No running loop (shouldn't happen inside an agent job); best-effort.
         return
@@ -57,32 +59,15 @@ def download_turn_detector_files() -> None:
 
 
 def maybe_turn_detection():
-    """Create turn-detection model if available; otherwise return None."""
-    try:
-        # Turn-detector needs an inference executor; local/dev setups often don't have one.
-        try:
-            from livekit.agents.job import get_job_context
-
-            jc = get_job_context()
-            if getattr(jc, "inference_executor", None) is None:
-                print("⚠️ turn_detection disabled: no inference executor")
-                return None
-        except Exception:
-            # If job context is unavailable, don't enable turn detection.
-            print("⚠️ turn_detection disabled: no job context / no inference executor")
-            return None
-
-        from livekit.plugins.turn_detector.multilingual import MultilingualModel
-
-        # This model requires a LiveKit inference executor. In some local/dev setups
-        # (or missing inference runtime), it spams:
-        #   "no inference executor"
-        # We'll disable turn detection in that case and fall back to VAD behavior.
-        m = MultilingualModel()
-        return m
-    except Exception as e:
-        print(f"⚠️ turn_detection disabled: {type(e).__name__}: {e}")
-        return None
+    """
+    Create turn-detection model if available; otherwise return None.
+    
+    Note: Turn detection requires an inference executor. If not available,
+    VAD (Voice Activity Detection) will handle turn detection instead.
+    """
+    # Disable turn detection to avoid "no inference executor" errors
+    # VAD will handle turn detection which works without inference executor
+    return None
 
 
 def tts_speaker(md: dict) -> str:
@@ -163,9 +148,6 @@ class DspyLLMStream(lk_llm.LLMStream):
         model_name = _llm_model()
         api_key = (os.getenv("DSPY_API_KEY") or "").strip() or None
         if not api_key:
-            # Convenience: fall back to the same env var people already have.
-            api_key = (os.getenv("OPENAI_API_KEY") or "").strip() or None
-        if not api_key:
             raise RuntimeError("Missing DSPY_API_KEY (or OPENAI_API_KEY) for DSPy LLM")
 
         model_path = _dspy_model_path(provider, model_name)
@@ -187,7 +169,13 @@ class DspyLLMStream(lk_llm.LLMStream):
             prompt: str = dspy.InputField()
             response: str = dspy.OutputField()
 
-        lm = dspy.LM(model_path, api_key=api_key, cache=False, temperature=temperature)
+        # Ensure api_base is never None for LiteLLM (workaround for LiteLLM logging bug)
+        # DSPy/LiteLLM internally may pass None, so we set it explicitly if needed
+        lm_kwargs = {"api_key": api_key, "cache": False, "temperature": temperature}
+        if provider == "azure" and api_base:
+            # For Azure, ensure api_base is set to avoid LiteLLM logging errors
+            lm_kwargs["api_base"] = api_base
+        lm = dspy.LM(model_path, **lm_kwargs)
         with dspy.context(lm=lm):
             predictor = dspy.Predict(ChatSig)
             pred = predictor(prompt=prompt)

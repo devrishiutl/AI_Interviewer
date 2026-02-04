@@ -97,7 +97,6 @@ def _room_metadata_json(interview_data: dict) -> str:
         if isinstance(cur, dict) and path[-1] in cur:
             cur.pop(path[-1], None)
             if _size() <= _ROOM_METADATA_MAX_BYTES:
-                print(f"⚠️ LiveKit metadata trimmed to fit limit (dropped {label})")
                 return _dump()
 
     # Last resort: keep only essentials used by agent, but still valid.
@@ -111,7 +110,6 @@ def _room_metadata_json(interview_data: dict) -> str:
         "interviewer": (md.get("interviewer") or {}) if isinstance(md.get("interviewer"), dict) else {},
     }
     md = essential
-    print("⚠️ LiveKit metadata trimmed to essentials to fit limit")
     return _dump()
 
 
@@ -362,24 +360,32 @@ async def ensure_agent_dispatched(lk: api.LiveKitAPI, *, room: str) -> api.Agent
         if existing_jobs is not None and len(existing_jobs) > 0:
             return existing_valid
 
-        # No job attached yet. This can be "eventually consistent" for a moment, or it can be stale.
-        # If we can confirm the agent is not present, wait briefly for jobs to appear; otherwise recreate.
+        # Wait briefly for jobs to appear (eventually consistent)
         did = getattr(existing_valid, "id", None)
         if isinstance(did, str) and did and participants_known:
-            for _ in range(5):
+            try:
+                await asyncio.wait_for(
+                    _wait_for_dispatch_jobs(lk, did, room),
+                    timeout=1.0
+                )
+                return existing_valid
+            except asyncio.TimeoutError:
                 with suppress(Exception):
-                    d2 = await lk.agent_dispatch.get_dispatch(dispatch_id=did, room_name=room)
-                    st2 = getattr(d2, "state", None) if d2 is not None else None
-                    jobs2 = getattr(st2, "jobs", None) or []
-                    if jobs2:
-                        return existing_valid
-                await asyncio.sleep(0.2)
-            with suppress(Exception):
-                await lk.agent_dispatch.delete_dispatch(dispatch_id=did, room_name=room)
-            return await lk.agent_dispatch.create_dispatch(
-                api.CreateAgentDispatchRequest(room=room, agent_name=LIVEKIT_AGENT_NAME)
-            )
+                    await lk.agent_dispatch.delete_dispatch(dispatch_id=did, room_name=room)
+                return await lk.agent_dispatch.create_dispatch(
+                    api.CreateAgentDispatchRequest(room=room, agent_name=LIVEKIT_AGENT_NAME)
+                )
         return existing_valid
+
+
+async def _wait_for_dispatch_jobs(lk: api.LiveKitAPI, dispatch_id: str, room: str) -> None:
+    """Wait for jobs to appear in dispatch."""
+    while True:
+        with suppress(Exception):
+            d = await lk.agent_dispatch.get_dispatch(dispatch_id=dispatch_id, room_name=room)
+            if d and getattr(getattr(d, "state", None), "jobs", None):
+                return
+        await asyncio.sleep(0.2)
 
     return await lk.agent_dispatch.create_dispatch(
         api.CreateAgentDispatchRequest(room=room, agent_name=LIVEKIT_AGENT_NAME)
@@ -515,7 +521,7 @@ async def extract_resume_text(file_path: str, client: httpx.AsyncClient, access_
     if not file_path:
         return None
     try:
-        url = "https://api.hrone.studio/api/storage-accounts/lego/download"
+        url = f"{HRONE_API}/storage-accounts/lego/download"
         full_url = f"{url}?name={quote(file_path, safe='')}"
         res = await client.get(full_url, headers=_hrone_headers(access_token))
         if res.status_code != 200:
@@ -749,6 +755,46 @@ async def resolve_ids_from_interview(*, interview_id: str, email: str, access_to
     return str(applicant_id), str(job_id), str(round_id), str(interviewer_id)
 
 
+async def _create_transcript_record(interview_id: str, access_token: str | None) -> str | None:
+    """Create a new transcript record in HROne."""
+    transcript_id = uuid.uuid4().hex
+    values = [
+        {"propertyId": TRANSCRIPTS_PROP_ID_TRANSCRIPT_ID, "key": TRANSCRIPTS_FIELD_TRANSCRIPT_ID, "value": transcript_id}
+        if TRANSCRIPTS_PROP_ID_TRANSCRIPT_ID else {"key": TRANSCRIPTS_FIELD_TRANSCRIPT_ID, "value": transcript_id},
+        {"propertyId": TRANSCRIPTS_PROP_ID_INTERVIEW_ID, "key": TRANSCRIPTS_FIELD_INTERVIEW_ID, "value": interview_id}
+        if TRANSCRIPTS_PROP_ID_INTERVIEW_ID else {"key": TRANSCRIPTS_FIELD_INTERVIEW_ID, "value": interview_id},
+        {"propertyId": TRANSCRIPTS_PROP_ID_TRANSCRIPT_JSON, "key": TRANSCRIPTS_FIELD_TRANSCRIPT_JSON, "value": []}
+        if TRANSCRIPTS_PROP_ID_TRANSCRIPT_JSON else {"key": TRANSCRIPTS_FIELD_TRANSCRIPT_JSON, "value": []},
+    ]
+    
+    record_id = await hrone_create_record(object_id=TRANSCRIPTS_OBJECT_ID, values=values, access_token=access_token)
+    if TRANSCRIPTS_VIEW_ID and not record_id:
+        record_id = await hrone_find_record_id_by_transcript_id(
+            object_id=TRANSCRIPTS_OBJECT_ID,
+            view_id=TRANSCRIPTS_VIEW_ID,
+            transcript_id=transcript_id,
+            access_token=access_token,
+        )
+    return record_id
+
+
+def _create_livekit_token(identity: str, name: str, room: str) -> api.AccessToken:
+    """Create LiveKit access token."""
+    return (
+        api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+        .with_identity(identity)
+        .with_name(name or "Participant")
+        .with_grants(api.VideoGrants(
+            room_join=True,
+            room=room,
+            can_subscribe=True,
+            can_publish=True,
+            can_publish_data=True
+        ))
+        .with_ttl(timedelta(hours=1))
+    )
+
+
 def _token_for_transcript(request: Request, *, interview_id: str, record_id: str | None) -> str:
     t = _extract_access_token(request)
     if t:
@@ -768,7 +814,6 @@ async def handle_start_interview(*, interview_id: str, email: str, request: Requ
     hrone_token, hrone_token_source = _extract_access_token_with_source(request)
     if hrone_token:
         _HRONE_TOKEN_BY_INTERVIEW_ID[interview_id] = hrone_token
-
     applicant_id, job_id, round_id, interviewer_id = await resolve_ids_from_interview(
         interview_id=interview_id, email=email, access_token=hrone_token
     )
@@ -786,35 +831,8 @@ async def handle_start_interview(*, interview_id: str, email: str, request: Requ
     if PUBLIC_API_URL:
         interview_data["transcriptApiUrl"] = f"{PUBLIC_API_URL.rstrip('/')}/api/transcript"
 
-    # Always start from scratch: create a NEW transcript record on every start-interview call.
-    transcript_record_id = None
-    if TRANSCRIPTS_OBJECT_ID:
-        transcript_id = uuid.uuid4().hex
-        values: list[dict] = []
-        if TRANSCRIPTS_PROP_ID_TRANSCRIPT_ID and TRANSCRIPTS_FIELD_TRANSCRIPT_ID:
-            values.append({"propertyId": TRANSCRIPTS_PROP_ID_TRANSCRIPT_ID, "key": TRANSCRIPTS_FIELD_TRANSCRIPT_ID, "value": transcript_id})
-        else:
-            values.append({"key": TRANSCRIPTS_FIELD_TRANSCRIPT_ID, "value": transcript_id})
-
-        if TRANSCRIPTS_PROP_ID_INTERVIEW_ID:
-            values.append({"propertyId": TRANSCRIPTS_PROP_ID_INTERVIEW_ID, "key": TRANSCRIPTS_FIELD_INTERVIEW_ID, "value": interview_id})
-        else:
-            values.append({"key": TRANSCRIPTS_FIELD_INTERVIEW_ID, "value": interview_id})
-
-        if TRANSCRIPTS_PROP_ID_TRANSCRIPT_JSON:
-            values.append({"propertyId": TRANSCRIPTS_PROP_ID_TRANSCRIPT_JSON, "key": TRANSCRIPTS_FIELD_TRANSCRIPT_JSON, "value": []})
-        else:
-            values.append({"key": TRANSCRIPTS_FIELD_TRANSCRIPT_JSON, "value": []})
-
-        created_id = await hrone_create_record(object_id=TRANSCRIPTS_OBJECT_ID, values=values, access_token=hrone_token)
-        transcript_record_id = created_id or None
-        if TRANSCRIPTS_VIEW_ID:
-            transcript_record_id = await hrone_find_record_id_by_transcript_id(
-                object_id=TRANSCRIPTS_OBJECT_ID,
-                view_id=TRANSCRIPTS_VIEW_ID,
-                transcript_id=transcript_id,
-                access_token=hrone_token,
-            )
+    # Create transcript record
+    transcript_record_id = await _create_transcript_record(interview_id, hrone_token) if TRANSCRIPTS_OBJECT_ID else None
 
     if transcript_record_id:
         # overwrite cache so /api/transcript can still work even if transcriptRecordId isn't sent
@@ -823,97 +841,15 @@ async def handle_start_interview(*, interview_id: str, email: str, request: Requ
         if hrone_token:
             _HRONE_TOKEN_BY_RECORD_ID[transcript_record_id] = hrone_token
 
-    # LiveKit room + dispatch
+    # Setup LiveKit room and token
     room = f"interview-{interview_id}"
-    # Use a stable identity per applicant so reconnects (or repeated /api/start-interview calls)
-    # don't create a brand-new participant identity each time.
     identity = f"candidate-{applicant_id}"
+    token = _create_livekit_token(identity, participant_name, room)
 
-    token = (
-        api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
-        .with_identity(identity)
-        .with_name(participant_name or "Participant")
-        .with_grants(
-            api.VideoGrants(room_join=True, room=room, can_subscribe=True, can_publish=True, can_publish_data=True)
-        )
-        .with_ttl(timedelta(hours=1))
+    # Setup LiveKit room and wait for agent
+    agent_joined, agent_present_now, dispatch_status, agent_participant_identity = await _setup_livekit_room(
+        room, interview_data
     )
-
-    dispatch = None
-    agent_joined = False
-    agent_present_now = False
-    dispatch_state_str = ""
-    assigned_worker_id = None
-    agent_participant_identity = None
-    dispatch_status = None
-
-    lk = api.LiveKitAPI(LIVEKIT_URL)
-    try:
-        # Remove stale legacy rooms like interview-1 that can steal worker assignments.
-        await _cleanup_legacy_numeric_rooms(lk, keep_room=room)
-
-        md_json = _room_metadata_json(interview_data)
-        await ensure_room_with_metadata(lk, room=room, md_json=md_json)
-        dispatch = await ensure_agent_dispatched(lk, room=room)
-
-        for _ in range(30):
-            try:
-                lp = await lk.room.list_participants(api.ListParticipantsRequest(room=room))
-                participants = getattr(lp, "participants", None) or []
-                agent_joined = any(
-                    isinstance(getattr(p, "identity", None), str)
-                    and getattr(p, "identity")
-                    and getattr(p, "identity").startswith("agent-")
-                    for p in participants
-                )
-                if agent_joined:
-                    break
-            except Exception:
-                pass
-            await asyncio.sleep(0.5)
-
-        # Current presence snapshot (more reliable than agentJoined after the fact)
-        try:
-            lp2 = await lk.room.list_participants(api.ListParticipantsRequest(room=room))
-            participants2 = getattr(lp2, "participants", None) or []
-            agent_present_now = any(
-                isinstance(getattr(p, "identity", None), str)
-                and getattr(p, "identity")
-                and getattr(p, "identity").startswith("agent-")
-                for p in participants2
-            )
-        except Exception:
-            # Don't claim presence if we couldn't verify it.
-            agent_present_now = False
-
-        # Helpful debug fields from dispatch/job state (note: dispatch state is eventually consistent).
-        try:
-            did = getattr(dispatch, "id", None)
-            if isinstance(did, str) and did:
-                for _ in range(20):
-                    d2 = await lk.agent_dispatch.get_dispatch(dispatch_id=did, room_name=room)
-                    if d2 is None:
-                        await asyncio.sleep(0.25)
-                        continue
-                    st = getattr(d2, "state", None)
-                    jobs = getattr(st, "jobs", None) or []
-                    if jobs:
-                        js = getattr(jobs[0], "state", None)
-                        status = getattr(js, "status", None)
-                        if isinstance(status, int):
-                            dispatch_status = agent_proto.JobStatus.Name(status)
-                        elif status is not None:
-                            dispatch_status = str(status)
-                        agent_participant_identity = getattr(js, "participant_identity", None) or agent_participant_identity
-                        break
-                    await asyncio.sleep(0.25)
-        except Exception:
-            pass
-
-        # worker_id is not available in the protocol we're using; keep it for debug compatibility.
-        assigned_worker_id = None
-    finally:
-        await lk.aclose()
 
     return {
         "success": True,
@@ -923,25 +859,104 @@ async def handle_start_interview(*, interview_id: str, email: str, request: Requ
         "livekitAgentName": LIVEKIT_AGENT_NAME,
         "identity": identity,
         "transcriptRecordId": transcript_record_id,
-        # HROne auth debug (explains why transcript may 401 later)
         "hroneTokenPresent": bool(hrone_token),
         "hroneTokenSource": hrone_token_source,
-        # useful ids (debug)
-        "interview_id": interview_id,
-        "applicant_id": applicant_id,
-        "job_id": job_id,
-        "round_id": round_id,
-        "interviewer_id": interviewer_id,
-        # dispatch/agent debug
         "agentJoined": agent_joined,
-        "dispatchId": getattr(dispatch, "id", None) if dispatch is not None else None,
-        "dispatchWorkerId": assigned_worker_id,
+        "dispatchId": None,  # Removed for simplicity
+        "dispatchWorkerId": None,
         "agentParticipantIdentity": agent_participant_identity,
         "dispatchStatus": dispatch_status,
         "agentPresentNow": agent_present_now,
         "resumed": False,
-        "interview_data": interview_data,
     }
+
+
+async def _setup_livekit_room(room: str, interview_data: dict) -> tuple[bool, bool, str | None, str | None]:
+    """Setup LiveKit room, dispatch agent, and return status."""
+    lk = api.LiveKitAPI(LIVEKIT_URL)
+    try:
+        await _cleanup_legacy_numeric_rooms(lk, keep_room=room)
+        md_json = _room_metadata_json(interview_data)
+        await ensure_room_with_metadata(lk, room=room, md_json=md_json)
+        dispatch = await ensure_agent_dispatched(lk, room=room)
+
+        try:
+            await asyncio.wait_for(_wait_for_agent_join(lk, room), timeout=15.0)
+            agent_joined = True
+        except asyncio.TimeoutError:
+            agent_joined = False
+
+        agent_present_now = await _check_agent_present(lk, room)
+        dispatch_status, agent_participant_identity = await _get_dispatch_info(lk, dispatch, room) if dispatch else (None, None)
+        return agent_joined, agent_present_now, dispatch_status, agent_participant_identity
+    finally:
+        await lk.aclose()
+
+
+async def _wait_for_agent_join(lk: api.LiveKitAPI, room: str) -> None:
+    """Wait for agent to join room."""
+    while True:
+        lp = await lk.room.list_participants(api.ListParticipantsRequest(room=room))
+        participants = getattr(lp, "participants", None) or []
+        if any(
+            isinstance(getattr(p, "identity", None), str)
+            and getattr(p, "identity", "").startswith("agent-")
+            for p in participants
+        ):
+            return
+        await asyncio.sleep(0.5)
+
+
+async def _check_agent_present(lk: api.LiveKitAPI, room: str) -> bool:
+    """Check if agent is currently present."""
+    try:
+        lp = await lk.room.list_participants(api.ListParticipantsRequest(room=room))
+        participants = getattr(lp, "participants", None) or []
+        return any(
+            isinstance(getattr(p, "identity", None), str)
+            and getattr(p, "identity", "").startswith("agent-")
+            for p in participants
+        )
+    except Exception:
+        return False
+
+
+async def _get_dispatch_info(lk: api.LiveKitAPI, dispatch: api.AgentDispatch, room: str) -> tuple[str | None, str | None]:
+    """Get dispatch status and agent identity."""
+    try:
+        did = getattr(dispatch, "id", None)
+        if not isinstance(did, str):
+            return None, None
+        
+        await asyncio.wait_for(
+            _wait_for_dispatch_state(lk, did, room),
+            timeout=5.0
+        )
+        d = await lk.agent_dispatch.get_dispatch(dispatch_id=did, room_name=room)
+        if not d:
+            return None, None
+        
+        st = getattr(d, "state", None)
+        jobs = getattr(st, "jobs", None) or []
+        if not jobs:
+            return None, None
+        
+        js = getattr(jobs[0], "state", None)
+        status = getattr(js, "status", None)
+        status_str = agent_proto.JobStatus.Name(status) if isinstance(status, int) else str(status) if status else None
+        identity = getattr(js, "participant_identity", None)
+        return status_str, identity
+    except Exception:
+        return None, None
+
+
+async def _wait_for_dispatch_state(lk: api.LiveKitAPI, dispatch_id: str, room: str) -> None:
+    """Wait for dispatch to have state."""
+    while True:
+        d = await lk.agent_dispatch.get_dispatch(dispatch_id=dispatch_id, room_name=room)
+        if d and getattr(getattr(d, "state", None), "jobs", None):
+            return
+        await asyncio.sleep(0.25)
 
 
 async def handle_transcript(
@@ -955,40 +970,42 @@ async def handle_transcript(
     room: str | None,
     transcript_record_id: str | None,
 ) -> dict:
-    if not TRANSCRIPTS_OBJECT_ID:
-        raise HTTPException(500, "HRONE_TRANSCRIPTS_OBJECT_ID not configured")
-    if not _can_write_transcript_json():
-        return {"success": False, "reason": "missing transcriptJson propertyIds"}
+    if not TRANSCRIPTS_OBJECT_ID or not _can_write_transcript_json():
+        return {"success": False, "reason": "transcript not configured"}
 
     record_id = transcript_record_id or _TRANSCRIPT_RECORD_BY_INTERVIEW_ID.get(interview_id)
     if not record_id:
         return {"success": False, "reason": "missing transcriptRecordId"}
 
     hrone_token = _token_for_transcript(request, interview_id=interview_id, record_id=record_id)
-
-    ts = timestamp_ms if timestamp_ms is not None else int(time.time() * 1000)
-    row = [
+    timestamp = timestamp_ms or int(time.time() * 1000)
+    
+    # Get existing transcript and append new row
+    current = await hrone_get_record(object_id=TRANSCRIPTS_OBJECT_ID, record_id=record_id, access_token=hrone_token)
+    transcript_json = extract_field_value(current, TRANSCRIPTS_FIELD_TRANSCRIPT_JSON) if current else []
+    if not isinstance(transcript_json, list):
+        transcript_json = []
+    
+    transcript_json.append([
         {"propertyId": TRANSCRIPTS_PROP_ID_ROLE, "key": "role", "value": role},
         {"propertyId": TRANSCRIPTS_PROP_ID_SPEAKER_NAME, "key": "speakerName", "value": speaker_name or ""},
         {"propertyId": TRANSCRIPTS_PROP_ID_TEXT, "key": "text", "value": text},
-        {"propertyId": TRANSCRIPTS_PROP_ID_TIMESTAMP, "key": "timestamp", "value": ts},
-    ]
-
-    current = await hrone_get_record(object_id=TRANSCRIPTS_OBJECT_ID, record_id=record_id, access_token=hrone_token)
-    existing = extract_field_value(current, TRANSCRIPTS_FIELD_TRANSCRIPT_JSON) if current is not None else None
-    transcript_json = existing if isinstance(existing, list) else []
-    transcript_json.append(row)
+        {"propertyId": TRANSCRIPTS_PROP_ID_TIMESTAMP, "key": "timestamp", "value": timestamp},
+    ])
 
     try:
         await hrone_update_record(
             object_id=TRANSCRIPTS_OBJECT_ID,
             record_id=record_id,
-            values=[{"propertyId": TRANSCRIPTS_PROP_ID_TRANSCRIPT_JSON, "key": TRANSCRIPTS_FIELD_TRANSCRIPT_JSON, "value": transcript_json}],
+            values=[{
+                "propertyId": TRANSCRIPTS_PROP_ID_TRANSCRIPT_JSON,
+                "key": TRANSCRIPTS_FIELD_TRANSCRIPT_JSON,
+                "value": transcript_json
+            }],
             access_token=hrone_token,
         )
         return {"success": True}
     except HTTPException as e:
-        print(f"⚠️ transcript update failed: {e.detail}")
         return {"success": False, "reason": str(e.detail)}
 
 
@@ -999,52 +1016,30 @@ async def handle_feedback(
     experience: str,
     rating: int,
 ) -> dict:
-    """Create a feedback record in HROne for the interview."""
+    """Create a feedback record in HROne."""
     if not FEEDBACK_OBJECT_ID:
-        return {"success": False, "reason": "HRONE_FEEDBACK_OBJECT_ID not configured"}
-
-    # Get HROne token from request
-    hrone_token = _extract_access_token(request)
-
-    # Validate rating (typically 1-5 or 1-10)
-    if not isinstance(rating, int) or rating < 1 or rating > 10:
+        return {"success": False, "reason": "feedback not configured"}
+    
+    if not isinstance(rating, int) or not (1 <= rating <= 10):
         return {"success": False, "reason": "rating must be between 1 and 10"}
-
-    # Validate experience text
+    
     if not isinstance(experience, str) or not experience.strip():
         return {"success": False, "reason": "experience text is required"}
 
-    # Prepare values for HROne record
-    timestamp_ms = int(time.time() * 1000)
-    values: list[dict] = []
-
-    # Add interviewId
-    if FEEDBACK_PROP_ID_INTERVIEW_ID:
-        values.append({"propertyId": FEEDBACK_PROP_ID_INTERVIEW_ID, "key": FEEDBACK_FIELD_INTERVIEW_ID, "value": interview_id})
-    else:
-        values.append({"key": FEEDBACK_FIELD_INTERVIEW_ID, "value": interview_id})
-
-    # Add experience
-    if FEEDBACK_PROP_ID_EXPERIENCE:
-        values.append({"propertyId": FEEDBACK_PROP_ID_EXPERIENCE, "key": FEEDBACK_FIELD_EXPERIENCE, "value": experience.strip()})
-    else:
-        values.append({"key": FEEDBACK_FIELD_EXPERIENCE, "value": experience.strip()})
-
-    # Add rating
-    if FEEDBACK_PROP_ID_RATING:
-        values.append({"propertyId": FEEDBACK_PROP_ID_RATING, "key": FEEDBACK_FIELD_RATING, "value": rating})
-    else:
-        values.append({"key": FEEDBACK_FIELD_RATING, "value": rating})
-
-    # Add timestamp
-    if FEEDBACK_PROP_ID_TIMESTAMP:
-        values.append({"propertyId": FEEDBACK_PROP_ID_TIMESTAMP, "key": FEEDBACK_FIELD_TIMESTAMP, "value": timestamp_ms})
-    else:
-        values.append({"key": FEEDBACK_FIELD_TIMESTAMP, "value": timestamp_ms})
+    hrone_token = _extract_access_token(request)
+    values = [
+        {"propertyId": FEEDBACK_PROP_ID_INTERVIEW_ID, "key": FEEDBACK_FIELD_INTERVIEW_ID, "value": interview_id}
+        if FEEDBACK_PROP_ID_INTERVIEW_ID else {"key": FEEDBACK_FIELD_INTERVIEW_ID, "value": interview_id},
+        {"propertyId": FEEDBACK_PROP_ID_EXPERIENCE, "key": FEEDBACK_FIELD_EXPERIENCE, "value": experience.strip()}
+        if FEEDBACK_PROP_ID_EXPERIENCE else {"key": FEEDBACK_FIELD_EXPERIENCE, "value": experience.strip()},
+        {"propertyId": FEEDBACK_PROP_ID_RATING, "key": FEEDBACK_FIELD_RATING, "value": rating}
+        if FEEDBACK_PROP_ID_RATING else {"key": FEEDBACK_FIELD_RATING, "value": rating},
+        {"propertyId": FEEDBACK_PROP_ID_TIMESTAMP, "key": FEEDBACK_FIELD_TIMESTAMP, "value": int(time.time() * 1000)}
+        if FEEDBACK_PROP_ID_TIMESTAMP else {"key": FEEDBACK_FIELD_TIMESTAMP, "value": int(time.time() * 1000)},
+    ]
 
     try:
         record_id = await hrone_create_record(object_id=FEEDBACK_OBJECT_ID, values=values, access_token=hrone_token)
         return {"success": True, "feedbackRecordId": record_id}
     except HTTPException as e:
-        print(f"⚠️ feedback creation failed: {e.detail}")
         return {"success": False, "reason": str(e.detail)}
