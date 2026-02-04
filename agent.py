@@ -8,6 +8,7 @@ AI Interview Agent (minimal)
 
 import asyncio
 import json
+import logging
 import os
 import sys
 import traceback
@@ -15,7 +16,32 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from livekit import agents
-from livekit.agents import Agent, AgentSession, RoomInputOptions
+from livekit.agents import Agent, AgentSession, room_io
+
+# Setup logging to file
+_LOG_DIR = Path(__file__).parent / "logs"
+_LOG_DIR.mkdir(exist_ok=True)
+_LOG_FILE = _LOG_DIR / "agent.log"
+
+_logger = logging.getLogger("ai_interviewer_agent")
+_logger.setLevel(logging.DEBUG)
+
+# File handler
+_file_handler = logging.FileHandler(_LOG_FILE)
+_file_handler.setLevel(logging.DEBUG)
+_file_formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+_file_handler.setFormatter(_file_formatter)
+_logger.addHandler(_file_handler)
+
+# Console handler (also log to console)
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(logging.INFO)
+_console_formatter = logging.Formatter("%(levelname)s: %(message)s")
+_console_handler.setFormatter(_console_formatter)
+_logger.addHandler(_console_handler)
 from all_agent_functions import (
     build_instructions,
     build_welcome,
@@ -155,7 +181,7 @@ async def _wait_for_candidate(ctx: agents.JobContext) -> None:
 
 async def entrypoint(ctx: agents.JobContext):
     try:
-        print("🎯 Agent job received; starting…")
+        _logger.info("Agent job received; starting")
         # Plugins are imported/registered during process prewarm on the main thread (see prewarm()).
         deepgram = _PLUGINS["deepgram"]
         noise_cancellation = _PLUGINS["noise_cancellation"]
@@ -165,39 +191,44 @@ async def entrypoint(ctx: agents.JobContext):
         if not all([deepgram, noise_cancellation, openai, sarvam, silero]):
             raise RuntimeError("LiveKit plugins not loaded. Did prewarm() fail?")
 
+        _logger.info("Connecting to room...")
         await ctx.connect()
+        _logger.info("Connected to room")
 
         # Wait for metadata with timeout
         try:
+            _logger.info("Waiting for room metadata...")
             await asyncio.wait_for(_wait_for_metadata(ctx), timeout=5.0)
+            _logger.info("Room metadata received")
         except asyncio.TimeoutError:
-            print("❌ No room metadata (start interview via /api/start-interview)")
+            _logger.error("No room metadata (start interview via /api/start-interview)")
             return
 
         try:
             md = json.loads(ctx.room.metadata)
         except Exception as e:
-            print(f"❌ Invalid metadata JSON: {e}")
+            _logger.exception(f"Invalid metadata JSON: {e}")
             return
         if not isinstance(md, dict) or not md.get("applicant") or not md.get("job"):
-            print("❌ Missing required metadata (applicant/job)")
+            _logger.error("Missing required metadata (applicant/job)")
             return
 
         try:
             tts = create_tts(md=md, sarvam_plugin=sarvam)
         except Exception as e:
-            print(f"❌ Failed to create TTS: {type(e).__name__}: {e}")
+            _logger.exception(f"Failed to create TTS: {type(e).__name__}: {e}")
             return
         if tts is None:
             # If TTS is missing/disabled, LiveKit Playground will show "Waiting for agent audio track…".
             # Make this explicit so it doesn't look like the agent is "disabled".
-            print(
-                "❌ TTS is not configured (no audio will be published). "
+            _logger.error(
+                "TTS is not configured (no audio will be published). "
                 "Set SPEECHIFY_API_KEY (+ SPEECHIFY_VOICE_ID) or SARVAM_API_KEY, "
                 "or set TTS_PROVIDER=speechify|sarvam explicitly."
             )
             return
 
+        _logger.info("Creating agent session...")
         session = InterviewSession(
             stt=deepgram.STT(model="nova-2", language="en"),
             llm=create_llm(openai_plugin=openai),
@@ -218,36 +249,43 @@ async def entrypoint(ctx: agents.JobContext):
             }
         )
 
+        _logger.info("Starting agent session...")
         await session.start(
             room=ctx.room,
             agent=InterviewerAgent(instructions=build_instructions(md)),
             # Keep agent running even if the browser disconnects/reconnects.
-            # Note: RoomInputOptions is deprecated but still works in current version
-            room_input_options=RoomInputOptions(
-                noise_cancellation=noise_cancellation.BVC(),
-                close_on_disconnect=False
+            room_options=room_io.RoomOptions(
+                audio_input=room_io.AudioInputOptions(
+                    noise_cancellation=noise_cancellation.BVC(),
+                ),
+                close_on_disconnect=False,
             ),
         )
 
-        # Wait for candidate
-        try:
-            await asyncio.wait_for(_wait_for_candidate(ctx), timeout=60.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            raise
+        # Wait for candidate and greet (non-blocking - agent stays alive)
+        async def wait_and_greet():
+            try:
+                await asyncio.wait_for(_wait_for_candidate(ctx), timeout=900.0)
+                _logger.info("Candidate joined, sending welcome message")
+                welcome = build_welcome(md)
+                try:
+                    await session.say(welcome)
+                except Exception as e:
+                    _logger.exception(f"Welcome TTS failed: {e}")
+                publish_playground_chat(ctx.room, welcome)
+                asyncio.create_task(post_transcript(session._ctx, role="Interviewer", text=welcome))
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                _logger.warning("Candidate did not join within timeout, but agent remains active")
 
-        welcome = build_welcome(md)
-        try:
-            await session.say(welcome)
-        except Exception as e:
-            print(f"⚠️ welcome TTS failed: {type(e).__name__}: {e}")
-        publish_playground_chat(ctx.room, welcome)
-        asyncio.create_task(post_transcript(session._ctx, role="Interviewer", text=welcome))
+        # Start greeting task in background - don't block agent
+        asyncio.create_task(wait_and_greet())
 
+        # Keep agent running
+        _logger.info("Agent session active, waiting for interactions...")
         while True:
             await asyncio.sleep(1)
     except Exception:
-        print("❌ Agent crashed while starting/joining:")
-        print(traceback.format_exc())
+        _logger.exception("Agent crashed while starting/joining:")
         raise
 
 

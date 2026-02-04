@@ -10,8 +10,9 @@ All implementation details live in `all_main_functions.py`.
 
 import os
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from all_main_functions import handle_start_interview, handle_transcript, handle_feedback
@@ -68,10 +69,25 @@ class FeedbackRequest(BaseModel):
 async def api_start_interview(req: StartInterviewRequest, request: Request):
     try:
         return await handle_start_interview(interview_id=req.interviewId, email=req.email, request=request)
+    except HTTPException:
+        # Re-raise HTTPException to return proper status codes
+        raise
+    except ValueError as e:
+        # Client error - invalid input
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid request: {str(e)}"
+        )
     except Exception as e:
-        # Keep API stable; just log which call failed.
+        # Server error - log and return 500
+        import traceback
+        error_details = traceback.format_exc()
         print(f"⚠️ /api/start-interview failed: {type(e).__name__}: {e}")
-        return {"success": False, "reason": "start-interview failed"}
+        print(f"Traceback:\n{error_details}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal server error: {type(e).__name__}: {str(e)}"
+        )
 
 
 @app.post("/api/transcript")
@@ -87,10 +103,22 @@ async def api_transcript(req: TranscriptRequest, request: Request):
             room=req.room,
             transcript_record_id=req.transcriptRecordId,
         )
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid request: {str(e)}"
+        )
     except Exception as e:
-        # Keep API stable; just log which call failed.
+        import traceback
+        error_details = traceback.format_exc()
         print(f"⚠️ /api/transcript failed: {type(e).__name__}: {e}")
-        return {"success": False, "reason": "transcript failed"}
+        print(f"Traceback:\n{error_details}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal server error: {type(e).__name__}: {str(e)}"
+        )
 
 
 @app.post("/api/feedback")
@@ -102,10 +130,22 @@ async def api_feedback(req: FeedbackRequest, request: Request):
             experience=req.experience,
             rating=req.rating,
         )
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid request: {str(e)}"
+        )
     except Exception as e:
-        # Keep API stable; just log which call failed.
+        import traceback
+        error_details = traceback.format_exc()
         print(f"⚠️ /api/feedback failed: {type(e).__name__}: {e}")
-        return {"success": False, "reason": "feedback failed"}
+        print(f"Traceback:\n{error_details}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal server error: {type(e).__name__}: {str(e)}"
+        )
 
 
 if __name__ == "__main__":

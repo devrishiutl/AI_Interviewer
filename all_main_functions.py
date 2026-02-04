@@ -8,6 +8,7 @@ All heavy lifting (HROne, LiveKit, transcript persistence, dispatch) lives here.
 import asyncio
 import io
 import json
+import logging
 import os
 import re
 import time
@@ -25,6 +26,31 @@ from livekit import api
 from livekit.api.twirp_client import TwirpError
 from livekit.protocol import agent as agent_proto
 from livekit.protocol import room as room_proto
+
+# Setup logging to file
+_LOG_DIR = Path(__file__).parent / "logs"
+_LOG_DIR.mkdir(exist_ok=True)
+_LOG_FILE = _LOG_DIR / "api.log"
+
+_logger = logging.getLogger("ai_interviewer")
+_logger.setLevel(logging.DEBUG)
+
+# File handler
+_file_handler = logging.FileHandler(_LOG_FILE)
+_file_handler.setLevel(logging.DEBUG)
+_file_formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+_file_handler.setFormatter(_file_formatter)
+_logger.addHandler(_file_handler)
+
+# Console handler (also log to console)
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(logging.INFO)
+_console_formatter = logging.Formatter("%(levelname)s: %(message)s")
+_console_handler.setFormatter(_console_formatter)
+_logger.addHandler(_console_handler)
 
 
 # -----------------------------------------------------------------------------
@@ -376,6 +402,11 @@ async def ensure_agent_dispatched(lk: api.LiveKitAPI, *, room: str) -> api.Agent
                     api.CreateAgentDispatchRequest(room=room, agent_name=LIVEKIT_AGENT_NAME)
                 )
         return existing_valid
+    
+    # No existing dispatch and no agent present - create a new dispatch
+    return await lk.agent_dispatch.create_dispatch(
+        api.CreateAgentDispatchRequest(room=room, agent_name=LIVEKIT_AGENT_NAME)
+    )
 
 
 async def _wait_for_dispatch_jobs(lk: api.LiveKitAPI, dispatch_id: str, room: str) -> None:
@@ -386,10 +417,6 @@ async def _wait_for_dispatch_jobs(lk: api.LiveKitAPI, dispatch_id: str, room: st
             if d and getattr(getattr(d, "state", None), "jobs", None):
                 return
         await asyncio.sleep(0.2)
-
-    return await lk.agent_dispatch.create_dispatch(
-        api.CreateAgentDispatchRequest(room=room, agent_name=LIVEKIT_AGENT_NAME)
-    )
 
 
 # -----------------------------------------------------------------------------
@@ -630,7 +657,7 @@ async def fetch_interview_data(*, job_id: str, applicant_id: str, round_id: str,
         }
 
 
-async def hrone_find_record_id_by_transcript_id(*, object_id: str, view_id: str, transcript_id: str, access_token: str | None) -> str | None:
+async def hrone_find_record_id_by_transcript_id(*, object_id: str, view_id: str, transcript_id: str, access_token: str | None):
     if not (object_id and view_id and transcript_id):
         return None
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -644,20 +671,7 @@ async def hrone_find_record_id_by_transcript_id(*, object_id: str, view_id: str,
                 "appId": APP_ID,
             },
         )
-        if res.status_code != 200:
-            print(f"⚠️ HROne view records failed: POST {url} -> {res.status_code} {_short(res.text)}")
-            return None
-        try:
-            payload = res.json()
-        except Exception:
-            print(f"⚠️ HROne view records invalid JSON: POST {url} -> {_short(res.text)}")
-            return None
-        records = payload.get("data", [])
-        if records and isinstance(records[0], dict):
-            record_id = records[0].get("id")
-            if isinstance(record_id, str) and record_id:
-                return record_id
-    return None
+        return res
 
 
 async def hrone_create_record(*, object_id: str, values: list[dict], access_token: str | None) -> str:
@@ -687,18 +701,11 @@ async def hrone_create_record(*, object_id: str, values: list[dict], access_toke
         return rid or ""
 
 
-async def hrone_get_record(*, object_id: str, record_id: str, access_token: str | None) -> dict | list | None:
+async def hrone_get_record(*, object_id: str, record_id: str, access_token: str | None):
     async with httpx.AsyncClient(timeout=15.0) as client:
         url = f"{HRONE_API}/objects/{object_id}/records/{record_id}"
-        res = await client.get(
-            url,
-            headers=_hrone_headers(access_token),
-            params={"appId": APP_ID},
-        )
-        if res.status_code != 200:
-            print(f"⚠️ HROne get failed: GET {url} -> {res.status_code} {_short(res.text)}")
-            return None
-        return res.json()
+        res = await client.get(url, headers=_hrone_headers(access_token), params={"appId": APP_ID})
+        return res
 
 
 async def hrone_update_record(*, object_id: str, record_id: str, values: list[dict], access_token: str | None) -> None:
@@ -722,9 +729,12 @@ def _lower(v) -> str:
 
 
 async def resolve_ids_from_interview(*, interview_id: str, email: str, access_token: str | None) -> tuple[str, str, str, str]:
-    interview_rec = await hrone_get_record(object_id=INTERVIEWS_OBJECT_ID, record_id=str(interview_id), access_token=access_token)
-    if interview_rec is None:
-        raise HTTPException(404, f"Interview record not found: {interview_id}")
+    res = await hrone_get_record(object_id=INTERVIEWS_OBJECT_ID, record_id=str(interview_id), access_token=access_token)
+    if res.status_code == 401:
+        raise HTTPException(401, f"Unauthorized access to HROne API: {res.text}")
+    if res.status_code != 200:
+        raise HTTPException(res.status_code, f"HROne API error: {res.text}")
+    interview_rec = res.json()
 
     applicant_id = extract_field_value(interview_rec, "applicantEmail") or extract_field_value(interview_rec, "applicantId")
     job_id = extract_field_value(interview_rec, "jobTitle") or extract_field_value(interview_rec, "jobId")
@@ -743,9 +753,10 @@ async def resolve_ids_from_interview(*, interview_id: str, email: str, access_to
     if missing:
         raise HTTPException(500, f"Interview record missing fields: {', '.join(missing)}")
 
-    applicant_rec = await hrone_get_record(object_id=APPLICANTS_OBJECT_ID, record_id=str(applicant_id), access_token=access_token)
-    if applicant_rec is None:
-        raise HTTPException(502, "Missing data from HROne: applicant")
+    res = await hrone_get_record(object_id=APPLICANTS_OBJECT_ID, record_id=str(applicant_id), access_token=access_token)
+    if res.status_code != 200:
+        raise HTTPException(res.status_code, f"HROne API error: {res.text}")
+    applicant_rec = res.json()
     expected_email = extract_field_value(applicant_rec, "email")
     if not expected_email:
         raise HTTPException(500, "Applicant record missing email")
@@ -769,12 +780,17 @@ async def _create_transcript_record(interview_id: str, access_token: str | None)
     
     record_id = await hrone_create_record(object_id=TRANSCRIPTS_OBJECT_ID, values=values, access_token=access_token)
     if TRANSCRIPTS_VIEW_ID and not record_id:
-        record_id = await hrone_find_record_id_by_transcript_id(
+        res = await hrone_find_record_id_by_transcript_id(
             object_id=TRANSCRIPTS_OBJECT_ID,
             view_id=TRANSCRIPTS_VIEW_ID,
             transcript_id=transcript_id,
             access_token=access_token,
         )
+        if res and res.status_code == 200:
+            payload = res.json()
+            records = payload.get("data", [])
+            if records and isinstance(records[0], dict):
+                record_id = records[0].get("id")
     return record_id
 
 
@@ -847,7 +863,7 @@ async def handle_start_interview(*, interview_id: str, email: str, request: Requ
     token = _create_livekit_token(identity, participant_name, room)
 
     # Setup LiveKit room and wait for agent
-    agent_joined, agent_present_now, dispatch_status, agent_participant_identity = await _setup_livekit_room(
+    agent_joined, agent_present_now, dispatch_status, agent_participant_identity, dispatch_id, dispatch_worker_id = await _setup_livekit_room(
         room, interview_data
     )
 
@@ -855,40 +871,50 @@ async def handle_start_interview(*, interview_id: str, email: str, request: Requ
         "success": True,
         "token": token.to_jwt(),
         "room": room,
-        "livekitUrl": LIVEKIT_URL,
+        "livekitUrl": os.getenv("PUBLIC_LIVEKIT_URL", LIVEKIT_URL),
         "livekitAgentName": LIVEKIT_AGENT_NAME,
         "identity": identity,
         "transcriptRecordId": transcript_record_id,
         "hroneTokenPresent": bool(hrone_token),
         "hroneTokenSource": hrone_token_source,
         "agentJoined": agent_joined,
-        "dispatchId": None,  # Removed for simplicity
-        "dispatchWorkerId": None,
+        "dispatchId": dispatch_id,
+        "dispatchWorkerId": dispatch_worker_id,
         "agentParticipantIdentity": agent_participant_identity,
         "dispatchStatus": dispatch_status,
         "agentPresentNow": agent_present_now,
         "resumed": False,
+        "interview_data": interview_data,
     }
 
 
-async def _setup_livekit_room(room: str, interview_data: dict) -> tuple[bool, bool, str | None, str | None]:
+async def _setup_livekit_room(room: str, interview_data: dict) -> tuple[bool, bool, str | None, str | None, str | None, str | None]:
     """Setup LiveKit room, dispatch agent, and return status."""
     lk = api.LiveKitAPI(LIVEKIT_URL)
     try:
         await _cleanup_legacy_numeric_rooms(lk, keep_room=room)
         md_json = _room_metadata_json(interview_data)
         await ensure_room_with_metadata(lk, room=room, md_json=md_json)
-        dispatch = await ensure_agent_dispatched(lk, room=room)
+        try:
+            dispatch = await ensure_agent_dispatched(lk, room=room)
+            dispatch_id = getattr(dispatch, "id", None) if dispatch else None
+            if dispatch_id:
+                _logger.info(f"Dispatch created: id={dispatch_id}")
+        except Exception as e:
+            _logger.exception(f"Failed to create dispatch: {e}")
+            dispatch = None
+            dispatch_id = None
 
         try:
-            await asyncio.wait_for(_wait_for_agent_join(lk, room), timeout=15.0)
+            await asyncio.wait_for(_wait_for_agent_join(lk, room), timeout=30.0)
             agent_joined = True
         except asyncio.TimeoutError:
             agent_joined = False
+            _logger.warning(f"Agent did not join room={room} within 30 seconds")
 
         agent_present_now = await _check_agent_present(lk, room)
-        dispatch_status, agent_participant_identity = await _get_dispatch_info(lk, dispatch, room) if dispatch else (None, None)
-        return agent_joined, agent_present_now, dispatch_status, agent_participant_identity
+        dispatch_status, agent_participant_identity, dispatch_worker_id = await _get_dispatch_info(lk, dispatch, room) if dispatch else (None, None, None)
+        return agent_joined, agent_present_now, dispatch_status, agent_participant_identity, dispatch_id, dispatch_worker_id
     finally:
         await lk.aclose()
 
@@ -921,12 +947,12 @@ async def _check_agent_present(lk: api.LiveKitAPI, room: str) -> bool:
         return False
 
 
-async def _get_dispatch_info(lk: api.LiveKitAPI, dispatch: api.AgentDispatch, room: str) -> tuple[str | None, str | None]:
-    """Get dispatch status and agent identity."""
+async def _get_dispatch_info(lk: api.LiveKitAPI, dispatch: api.AgentDispatch, room: str) -> tuple[str | None, str | None, str | None]:
+    """Get dispatch status, agent identity, and worker ID."""
     try:
         did = getattr(dispatch, "id", None)
         if not isinstance(did, str):
-            return None, None
+            return None, None, None
         
         await asyncio.wait_for(
             _wait_for_dispatch_state(lk, did, room),
@@ -934,20 +960,24 @@ async def _get_dispatch_info(lk: api.LiveKitAPI, dispatch: api.AgentDispatch, ro
         )
         d = await lk.agent_dispatch.get_dispatch(dispatch_id=did, room_name=room)
         if not d:
-            return None, None
+            return None, None, None
         
         st = getattr(d, "state", None)
         jobs = getattr(st, "jobs", None) or []
         if not jobs:
-            return None, None
+            return None, None, None
         
         js = getattr(jobs[0], "state", None)
         status = getattr(js, "status", None)
         status_str = agent_proto.JobStatus.Name(status) if isinstance(status, int) else str(status) if status else None
         identity = getattr(js, "participant_identity", None)
-        return status_str, identity
+        
+        # Get worker ID from job state
+        worker_id = getattr(js, "worker_id", None) or getattr(jobs[0], "worker_id", None)
+        
+        return status_str, identity, worker_id
     except Exception:
-        return None, None
+        return None, None, None
 
 
 async def _wait_for_dispatch_state(lk: api.LiveKitAPI, dispatch_id: str, room: str) -> None:
@@ -981,7 +1011,10 @@ async def handle_transcript(
     timestamp = timestamp_ms or int(time.time() * 1000)
     
     # Get existing transcript and append new row
-    current = await hrone_get_record(object_id=TRANSCRIPTS_OBJECT_ID, record_id=record_id, access_token=hrone_token)
+    res = await hrone_get_record(object_id=TRANSCRIPTS_OBJECT_ID, record_id=record_id, access_token=hrone_token)
+    if res.status_code != 200:
+        return
+    current = res.json()
     transcript_json = extract_field_value(current, TRANSCRIPTS_FIELD_TRANSCRIPT_JSON) if current else []
     if not isinstance(transcript_json, list):
         transcript_json = []
