@@ -58,42 +58,34 @@ from all_agent_functions import (
 
 _DOTENV_PATH = Path(__file__).with_name(".env")
 try:
-    load_dotenv(dotenv_path=_DOTENV_PATH, override=False)
+    # override=True so project .env wins over shell/IDE LIVEKIT_URL (e.g. ws://localhost:7880)
+    load_dotenv(dotenv_path=_DOTENV_PATH, override=True)
 except Exception:
     # Don't fail module import if .env isn't readable in the current environment.
     pass
 
 
+# Import plugins on the process main thread (required on Windows: prewarm runs on the
+# job runner thread, and LiveKit's Plugin.register_plugin() requires the main thread).
+# At worker startup the main thread loads this module, so registration succeeds.
+from livekit.plugins import deepgram, noise_cancellation, openai, sarvam, silero
+
 _PLUGINS = {
-    "deepgram": None,
-    "noise_cancellation": None,
-    "openai": None,
-    "sarvam": None,
-    "silero": None,
+    "deepgram": deepgram,
+    "noise_cancellation": noise_cancellation,
+    "openai": openai,
+    "sarvam": sarvam,
+    "silero": silero,
 }
 
 
 def prewarm(proc: agents.JobProcess):
     """
-    LiveKit plugins register themselves at import time.
-    On Windows (and with multiprocessing 'spawn'), importing plugins from a job task can crash with:
-      RuntimeError: Plugins must be registered on the main thread
-
-    prewarm_fnc runs on the job process main thread, and must be a TOP-LEVEL function
-    (so it can be pickled/imported by multiprocessing).
+    LiveKit calls prewarm on the job runner thread. Plugins are already registered
+    at module import time on the main thread (see above). No-op here; entrypoint
+    uses _PLUGINS filled at import.
     """
-    try:
-        from livekit.plugins import deepgram, noise_cancellation, openai, sarvam, silero
-
-        _PLUGINS["deepgram"] = deepgram
-        _PLUGINS["noise_cancellation"] = noise_cancellation
-        _PLUGINS["openai"] = openai
-        _PLUGINS["sarvam"] = sarvam
-        _PLUGINS["silero"] = silero
-    except Exception:
-        # Let the worker boot; failures will be visible in logs.
-        print("⚠️ Plugin prewarm import failed:")
-        print(traceback.format_exc())
+    _logger.info("Prewarm: plugins already loaded at import time")
 
 
 class InterviewerAgent(Agent):
@@ -298,8 +290,22 @@ if __name__ == "__main__":
     require_env("LIVEKIT_API_KEY")
     require_env("LIVEKIT_API_SECRET")
 
+    # Pass URL/keys explicitly so project .env is used (avoids shell/IDE overrides).
+    livekit_url = os.getenv("LIVEKIT_URL", "").strip()
+    livekit_api_key = os.getenv("LIVEKIT_API_KEY", "").strip()
+    livekit_api_secret = os.getenv("LIVEKIT_API_SECRET", "").strip()
+
+    _logger.info("Using LIVEKIT_URL=%s", livekit_url or "(empty)")
+    if livekit_url and "trycloudflare.com" in livekit_url:
+        _logger.warning(
+            "LIVEKIT_URL points to Cloudflare tunnel; for local server use ws://localhost:7880 in .env"
+        )
+
     agents.cli.run_app(
         agents.WorkerOptions(
+            ws_url=livekit_url,
+            api_key=livekit_api_key,
+            api_secret=livekit_api_secret,
             entrypoint_fnc=entrypoint,
             prewarm_fnc=prewarm,
             agent_name=os.getenv("LIVEKIT_AGENT_NAME", "interview-agent"),

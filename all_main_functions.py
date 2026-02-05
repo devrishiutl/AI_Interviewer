@@ -910,7 +910,11 @@ async def _setup_livekit_room(room: str, interview_data: dict) -> tuple[bool, bo
             agent_joined = True
         except asyncio.TimeoutError:
             agent_joined = False
-            _logger.warning(f"Agent did not join room={room} within 30 seconds")
+            _logger.warning(
+                "Agent did not join room=%s within 30 seconds. "
+                "On Windows, check logs/agent.log for 'Prewarm' or 'plugins not loaded' (plugin registration can fail on spawn).",
+                room,
+            )
 
         agent_present_now = await _check_agent_present(lk, room)
         dispatch_status, agent_participant_identity, dispatch_worker_id = await _get_dispatch_info(lk, dispatch, room) if dispatch else (None, None, None)
