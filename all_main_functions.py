@@ -217,6 +217,7 @@ LIVEKIT_EMPTY_TIMEOUT_S = int(os.getenv("LIVEKIT_EMPTY_TIMEOUT_S", "300"))
 LIVEKIT_DEPARTURE_TIMEOUT_S = int(os.getenv("LIVEKIT_DEPARTURE_TIMEOUT_S", "60"))
 
 HRONE_API = os.getenv("HRONE_API_URL", "https://api.hrone.studio/api")
+HRONE_API_KEY = os.getenv("HRONE_API_KEY", "")  # API key for keeper/local auth
 APP_ID = _require_env("HRONE_APP_ID")
 ORG_ID = _require_env("HRONE_ORG_ID")
 
@@ -467,6 +468,24 @@ def _hrone_headers(access_token: str | None) -> dict:
         "x-org-id": ORG_ID,
         "Cookie": f"access_token={token}",
     }
+
+
+# def _hrone_headers(access_token: str | None) -> dict:
+#     headers = {"Content-Type": "application/json"}
+#     # If API key is set, use it (for keeper/local auth)
+#     if HRONE_API_KEY:
+#         headers["X-API-Key"] = HRONE_API_KEY
+#         return headers
+#     # Otherwise use Bearer token (for HROne cloud)
+#     token = (access_token or "").strip()
+#     if not token:
+#         raise HTTPException(401, "Missing HROne access_token (Authorization: Bearer <token> OR cookie access_token)")
+#     headers.update({
+#         "x-app-id": APP_ID,
+#         "x-org-id": ORG_ID,
+#         "Cookie": f"access_token={token}",
+#     })
+#     return headers
 
 
 def _values_payload(values: list[dict]) -> dict:
