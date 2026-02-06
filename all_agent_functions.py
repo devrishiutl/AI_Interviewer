@@ -70,6 +70,42 @@ def maybe_turn_detection():
     return None
 
 
+# ============================================================================
+# TTS (plug-and-play)
+# ============================================================================
+
+def _create_speechify_tts(md: dict) -> "SpeechifyTTS":
+    """Create Speechify TTS instance."""
+    key = os.getenv("SPEECHIFY_API_KEY")
+    if not key:
+        raise RuntimeError("SPEECHIFY_API_KEY is missing")
+    
+    voice = (md.get("interviewer") or {}).get("voice") or "Female"
+    voice_id = os.getenv("SPEECHIFY_VOICE_ID_MALE" if voice == "Male" else "SPEECHIFY_VOICE_ID_FEMALE", "lauren")
+    return SpeechifyTTS(api_key=key, voice_id=voice_id)
+
+
+def _create_sarvam_tts(md: dict, sarvam_plugin) -> "lk_tts.TTS":
+    """Create Sarvam TTS instance."""
+    key = os.getenv("SARVAM_API_KEY")
+    if not key:
+        raise RuntimeError("SARVAM_API_KEY is missing")
+    
+    if sarvam_plugin is None:
+        raise RuntimeError("Sarvam plugin not loaded")
+    
+    voice = (md.get("interviewer") or {}).get("voice") or "Female"
+    speaker = "abhilash" if voice == "Male" else "anushka"
+    
+    return sarvam_plugin.TTS(
+        target_language_code="en-IN",
+        model="bulbul:v2",
+        speaker=speaker,
+        api_key=key,
+    )
+
+
+# Legacy function for backward compatibility
 def tts_speaker(md: dict) -> str:
     voice = (md.get("interviewer") or {}).get("voice") or "Female"
     return "abhilash" if voice == "Male" else "anushka"
@@ -231,34 +267,6 @@ def create_llm(*, openai_plugin):
     raise RuntimeError(f"Unknown LLM_BACKEND={backend!r}")
 
 
-# ============================================================================
-# TTS (plug-and-play)
-# ============================================================================
-
-def select_tts_provider() -> str | None:
-    """
-    Choose TTS provider.
-
-    - If TTS_PROVIDER is set, it must be one of: speechify | sarvam | none
-    - Else: SPEECHIFY_API_KEY -> speechify
-    - Else: SARVAM_API_KEY -> sarvam
-    """
-    p = (os.getenv("TTS_PROVIDER") or "").strip().lower()
-    if p in ("none", "off", "0", "false"):
-        return None
-    if p:
-        return p
-    if os.getenv("SPEECHIFY_API_KEY"):
-        return "speechify"
-    if os.getenv("SARVAM_API_KEY"):
-        return "sarvam"
-    return None
-
-
-def _speechify_base_url() -> str:
-    return (os.getenv("SPEECHIFY_BASE_URL") or "https://api.sws.speechify.com").rstrip("/")
-
-
 from livekit.agents import tts as lk_tts
 
 
@@ -288,7 +296,8 @@ class SpeechifyTTS(lk_tts.TTS):
 
         class _SpeechifyChunkedStream(lk_tts.ChunkedStream):
             async def _run(self, output_emitter):
-                url = f"{_speechify_base_url()}/v1/audio/speech"
+                base_url = (os.getenv("SPEECHIFY_BASE_URL") or "https://api.sws.speechify.com").rstrip("/")
+                url = f"{base_url}/v1/audio/speech"
                 headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
                 payload = {"input": text, "voice_id": voice_id}
                 if output_format:
@@ -338,40 +347,23 @@ class SpeechifyTTS(lk_tts.TTS):
 
 def create_tts(*, md: dict, sarvam_plugin=None):
     """
-    Factory:
-    - speechify: uses SPEECHIFY_API_KEY (direct HTTP integration, no plugin install needed)
-    - sarvam: uses existing livekit-plugins-sarvam (kept as-is)
+    Factory function to create TTS instance based on TTS_PROVIDER.
+    
+    Set TTS_PROVIDER=speechify or TTS_PROVIDER=sarvam in .env
+    Voice is automatically selected from interview metadata (interviewer.voice)
     """
-    provider = select_tts_provider()
-    if not provider:
+    provider = (os.getenv("TTS_PROVIDER") or "").strip().lower()
+    
+    if provider in ("none", "off", "0", "false", ""):
         return None
-
+    
     if provider == "speechify":
-        key = os.getenv("SPEECHIFY_API_KEY")
-        if not key:
-            raise RuntimeError("TTS_PROVIDER=speechify but SPEECHIFY_API_KEY is missing")
-        voice_id = (os.getenv("SPEECHIFY_VOICE_ID") or "").strip()
-        if not voice_id:
-            raise RuntimeError(
-                "Speechify TTS requires a voice_id. Set SPEECHIFY_VOICE_ID from Speechify Playground/Console."
-            )
-        fmt = (os.getenv("SPEECHIFY_FORMAT") or "").strip().lower()
-        return SpeechifyTTS(api_key=key, voice_id=voice_id, output_format=fmt or None)
-
+        return _create_speechify_tts(md)
+    
     if provider == "sarvam":
-        key = os.getenv("SARVAM_API_KEY")
-        if not key:
-            raise RuntimeError("TTS_PROVIDER=sarvam but SARVAM_API_KEY is missing")
-        if sarvam_plugin is None:
-            raise RuntimeError("Sarvam plugin not loaded")
-        return sarvam_plugin.TTS(
-            target_language_code="en-IN",
-            model="bulbul:v2",
-            speaker=tts_speaker(md),
-            api_key=key,
-        )
-
-    raise RuntimeError(f"Unknown TTS_PROVIDER={provider!r}")
+        return _create_sarvam_tts(md, sarvam_plugin)
+    
+    raise RuntimeError(f"Unknown TTS_PROVIDER={provider!r} (supported: speechify, sarvam, none)")
 
 
 def _norm_text(s: str) -> str:

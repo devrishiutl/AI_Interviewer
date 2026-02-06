@@ -1,0 +1,5 @@
+.env.*
+*.log
+uv.lock
+.venv
+.env

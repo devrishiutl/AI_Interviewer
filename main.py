@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from all_main_functions import handle_start_interview, handle_transcript, handle_feedback
+from all_llm_main_functions import generate_job_description
 
 
 app = FastAPI(title="AI Interview Bot API")
@@ -58,6 +59,15 @@ class FeedbackRequest(BaseModel):
     interviewId: str
     experience: str  # "How was your experience with AI interviewer?"
     rating: int  # "Rate AI interviewer" (e.g., 1-5 or 1-10)
+
+
+class GenerateJobDescriptionRequest(BaseModel):
+    jobTitle: str
+    industry: str | None = None
+    jobLevel: str | None = None
+    jobType: str | None = None
+    minExp: int | None = None
+    maxExp: int | None = None
 
 
 # -----------------------------------------------------------------------------
@@ -141,6 +151,39 @@ async def api_feedback(req: FeedbackRequest, request: Request):
         import traceback
         error_details = traceback.format_exc()
         print(f"⚠️ /api/feedback failed: {type(e).__name__}: {e}")
+        print(f"Traceback:\n{error_details}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal server error: {type(e).__name__}: {str(e)}"
+        )
+
+
+@app.post("/api/generate-job-description")
+async def api_generate_job_description(req: GenerateJobDescriptionRequest):
+    try:
+        job_description = await generate_job_description(
+            job_title=req.jobTitle,
+            industry=req.industry,
+            job_level=req.jobLevel,
+            job_type=req.jobType,
+            min_exp=req.minExp,
+            max_exp=req.maxExp,
+        )
+        return {
+            "success": True,
+            "jobDescription": job_description,
+        }
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid request: {str(e)}"
+        )
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"⚠️ /api/generate-job-description failed: {type(e).__name__}: {e}")
         print(f"Traceback:\n{error_details}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

@@ -432,64 +432,74 @@ def _extract_access_token(request: Request | None) -> str | None:
 def _extract_access_token_with_source(request: Request | None) -> tuple[str | None, str]:
     """
     Returns (token, source) where source is one of:
-    - "authorization"
-    - "x-hrone-access-token"
-    - "cookie"
+    - "authorization" (Bearer token)
+    - "cookie" (access_token cookie)
+    - "x-api-key" (x-api-key header)
     - "none"
+    
+    Checks in order: Bearer token -> Cookie -> x-api-key
     """
     if request is None:
         return None, "none"
 
+    # 1. Check Bearer token in Authorization header
     auth = request.headers.get("authorization") or request.headers.get("Authorization")
     if auth and auth.lower().startswith("bearer "):
         tok = auth.split(" ", 1)[1].strip() or None
-        return tok, ("authorization" if tok else "none")
+        if tok:
+            return tok, "authorization"
 
-    header_token = request.headers.get("x-hrone-access-token") or request.headers.get("X-HROne-Access-Token")
-    if header_token:
-        tok = header_token.strip() or None
-        return tok, ("x-hrone-access-token" if tok else "none")
-
+    # 2. Check access_token in Cookie header
     cookie_token = request.cookies.get("access_token")
     if cookie_token:
         tok = cookie_token.strip() or None
-        return tok, ("cookie" if tok else "none")
+        if tok:
+            return tok, "cookie"
+
+    # 3. Check x-api-key header
+    api_key = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
+    if api_key:
+        tok = api_key.strip() or None
+        if tok:
+            return tok, "x-api-key"
 
     return None, "none"
 
 
 def _hrone_headers(access_token: str | None) -> dict:
+    """
+    Create headers for HROne API calls.
+    Uses token from request (Bearer/Cookie/x-api-key) or falls back to HRONE_API_KEY env var.
+    """
+    headers = {"Content-Type": "application/json"}
+    headers["x-app-id"] = APP_ID
+    if ORG_ID:
+        headers["x-org-id"] = ORG_ID
+    
+    # If token provided from request, use it
     token = (access_token or "").strip()
-    if not token:
-        raise HTTPException(401, "Missing HROne access_token (Authorization: Bearer <token> OR cookie access_token)")
-    return {
-        "Content-Type": "application/json",
-        "x-app-id": APP_ID,
-        "x-org-id": ORG_ID,
-        "Cookie": f"access_token={token}",
-    }
-
-
-# def _hrone_headers(access_token: str | None) -> dict:
-#     headers = {"Content-Type": "application/json"}
-#     # If API key is set, use it (for keeper/local auth)
-#     if HRONE_API_KEY:
-#         headers["X-API-Key"] = HRONE_API_KEY
-#         return headers
-#     # Otherwise use Bearer token (for HROne cloud)
-#     token = (access_token or "").strip()
-#     if not token:
-#         raise HTTPException(401, "Missing HROne access_token (Authorization: Bearer <token> OR cookie access_token)")
-#     headers.update({
-#         "x-app-id": APP_ID,
-#         "x-org-id": ORG_ID,
-#         "Cookie": f"access_token={token}",
-#     })
-#     return headers
+    if token:
+        # If it's an API key (starts with sk_), use x-api-key header
+        if token.startswith("sk_"):
+            headers["x-api-key"] = token
+        else:
+            # JWT token (from Bearer or Cookie) - use in Cookie header
+            headers["Cookie"] = f"access_token={token}"
+        return headers
+    
+    # Fallback to HRONE_API_KEY from env if no token from request
+    if HRONE_API_KEY:
+        headers["x-api-key"] = HRONE_API_KEY
+        return headers
+    
+    raise HTTPException(401, "Missing HROne access_token (Authorization: Bearer <token> OR cookie access_token OR x-api-key header)")
 
 
 def _values_payload(values: list[dict]) -> dict:
     pids = [v["propertyId"] for v in values if isinstance(v.get("propertyId"), str) and v.get("propertyId")]
+    # Keeper API requires both values with key field and propertyIds array
+    if HRONE_API_KEY:
+        return {"values": values, "propertyIds": pids if pids else []}
     return {"values": values, **({"propertyIds": pids} if pids else {})}
 
 
@@ -696,10 +706,11 @@ async def hrone_find_record_id_by_transcript_id(*, object_id: str, view_id: str,
 async def hrone_create_record(*, object_id: str, values: list[dict], access_token: str | None) -> str:
     async with httpx.AsyncClient(timeout=15.0) as client:
         url = f"{HRONE_API}/objects/{object_id}/records"
+        params = {} if HRONE_API_KEY else {"appId": APP_ID}  # No appId in params when using API key
         res = await client.post(
             url,
             headers=_hrone_headers(access_token),
-            params={"appId": APP_ID},
+            params=params,
             json=_values_payload(values),
         )
         if res.status_code not in (200, 201):
