@@ -473,18 +473,18 @@ def _hrone_headers(access_token: str | None) -> dict:
         "x-org-id": ORG_ID,
     }
 
-    # Always prefer API key
+    token = (access_token or "").strip()
+    if token:
+        # Prefer request token (Authorization Bearer — extracted from Authorization header or cookies)
+        headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    # Fallback to server-side API key if no request token present
     if HRONE_API_KEY:
         headers["x-api-key"] = HRONE_API_KEY
         return headers
 
-    # Fallback: token from request
-    token = (access_token or "").strip()
-    if token:
-        headers["x-api-key"] = token
-        return headers
-
-    raise HTTPException(401, "Missing HROne API key")
+    raise HTTPException(401, "Missing HROne API key or access token")
 
 
 def _values_payload(values: list[dict]) -> dict:
@@ -733,7 +733,7 @@ async def hrone_create_record(*, object_id: str, values: list[dict], access_toke
 async def hrone_get_record(*, object_id: str, record_id: str, access_token: str | None):
     async with httpx.AsyncClient(timeout=15.0) as client:
         url = f"{HRONE_API_URL}/objects/{object_id}/records/{record_id}"
-        res = await client.get(url, headers=_hrone_headers(access_token), params=_hrone_params())
+        res = await client.get(url, headers=_hrone_headers(access_token), params=_hrone_params())        
         return res
 
 
