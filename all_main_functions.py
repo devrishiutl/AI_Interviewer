@@ -216,7 +216,7 @@ PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "")  # optional; needed for remote 
 LIVEKIT_EMPTY_TIMEOUT_S = int(os.getenv("LIVEKIT_EMPTY_TIMEOUT_S", "300"))
 LIVEKIT_DEPARTURE_TIMEOUT_S = int(os.getenv("LIVEKIT_DEPARTURE_TIMEOUT_S", "60"))
 
-HRONE_API = os.getenv("HRONE_API_URL", "https://api.hrone.studio/api")
+HRONE_API_URL = os.getenv("HRONE_API_URL", "https://api.hrone.studio/api")
 HRONE_API_KEY = os.getenv("HRONE_API_KEY", "")  # API key for keeper/local auth
 APP_ID = _require_env("HRONE_APP_ID")
 ORG_ID = _require_env("HRONE_ORG_ID")
@@ -467,40 +467,31 @@ def _extract_access_token_with_source(request: Request | None) -> tuple[str | No
 
 
 def _hrone_headers(access_token: str | None) -> dict:
-    """
-    Create headers for HROne API calls.
-    Uses token from request (Bearer/Cookie/x-api-key) or falls back to HRONE_API_KEY env var.
-    """
-    headers = {"Content-Type": "application/json"}
-    headers["x-app-id"] = APP_ID
-    if ORG_ID:
-        headers["x-org-id"] = ORG_ID
-    
-    # If token provided from request, use it
-    token = (access_token or "").strip()
-    if token:
-        # If it's an API key (starts with sk_), use x-api-key header
-        if token.startswith("sk_"):
-            headers["x-api-key"] = token
-        else:
-            # JWT token (from Bearer or Cookie) - use in Cookie header
-            headers["Cookie"] = f"access_token={token}"
-        return headers
-    
-    # Fallback to HRONE_API_KEY from env if no token from request
+    headers = {
+        "Content-Type": "application/json",
+        "x-app-id": APP_ID,
+        "x-org-id": ORG_ID,
+    }
+
+    # Always prefer API key
     if HRONE_API_KEY:
         headers["x-api-key"] = HRONE_API_KEY
         return headers
-    
-    raise HTTPException(401, "Missing HROne access_token (Authorization: Bearer <token> OR cookie access_token OR x-api-key header)")
+
+    # Fallback: token from request
+    token = (access_token or "").strip()
+    if token:
+        headers["x-api-key"] = token
+        return headers
+
+    raise HTTPException(401, "Missing HROne API key")
 
 
 def _values_payload(values: list[dict]) -> dict:
     pids = [v["propertyId"] for v in values if isinstance(v.get("propertyId"), str) and v.get("propertyId")]
     # Keeper API requires both values with key field and propertyIds array
-    if HRONE_API_KEY:
-        return {"values": values, "propertyIds": pids if pids else []}
-    return {"values": values, **({"propertyIds": pids} if pids else {})}
+    return {"values": values, "propertyIds": pids}
+
 
 
 def extract_field_value(record, field_key: str):
@@ -532,7 +523,7 @@ def extract_skills(record) -> list:
 
 
 def extract_round_questions(record) -> list:
-    questions_data = extract_field_value(record, "_questions")
+    questions_data = extract_field_value(record, "v2_questions")
     if not questions_data or not isinstance(questions_data, list):
         return []
     questions = []
@@ -540,7 +531,7 @@ def extract_round_questions(record) -> list:
         if isinstance(question_group, list):
             question_text = None
             for item in question_group:
-                if isinstance(item, dict) and item.get("key") == "_question":
+                if isinstance(item, dict) and item.get("key") == "v2_question":
                     question_text = item.get("value")
             if question_text:
                 questions.append(question_text.strip() if isinstance(question_text, str) else str(question_text))
@@ -577,7 +568,7 @@ async def extract_resume_text(file_path: str, client: httpx.AsyncClient, access_
     if not file_path:
         return None
     try:
-        url = f"{HRONE_API}/storage-accounts/lego/download"
+        url = f"{HRONE_API_URL}/storage-accounts/lego/download"
         full_url = f"{url}?name={quote(file_path, safe='')}"
         res = await client.get(full_url, headers=_hrone_headers(access_token))
         if res.status_code != 200:
@@ -601,16 +592,24 @@ async def extract_resume_text(file_path: str, client: httpx.AsyncClient, access_
     except Exception:
         return None
 
+def _hrone_params():
+    return {"appId": APP_ID}
 
 async def fetch_interview_data(*, job_id: str, applicant_id: str, round_id: str, interviewer_id: str, access_token: str | None) -> dict:
     async with httpx.AsyncClient(timeout=60.0) as client:
         def _url(object_id: str, record_id: str) -> str:
-            return f"{HRONE_API}/objects/{object_id}/records/{record_id}"
+            return f"{HRONE_API_URL}/objects/{object_id}/records/{record_id}"
 
-        job = await client.get(_url(JOBS_OBJECT_ID, job_id), headers=_hrone_headers(access_token), params={"appId": APP_ID})
-        applicant = await client.get(_url(APPLICANTS_OBJECT_ID, applicant_id), headers=_hrone_headers(access_token), params={"appId": APP_ID})
-        round_ = await client.get(_url(ROUNDS_OBJECT_ID, round_id), headers=_hrone_headers(access_token), params={"appId": APP_ID})
-        interviewer = await client.get(_url(INTERVIEWERS_OBJECT_ID, interviewer_id), headers=_hrone_headers(access_token), params={"appId": APP_ID})
+        # job = await client.get(_url(JOBS_OBJECT_ID, job_id), headers=_hrone_headers(access_token), params={"appId": APP_ID})
+        # applicant = await client.get(_url(APPLICANTS_OBJECT_ID, applicant_id), headers=_hrone_headers(access_token), params={"appId": APP_ID})
+        # round_ = await client.get(_url(ROUNDS_OBJECT_ID, round_id), headers=_hrone_headers(access_token), params={"appId": APP_ID})
+        # interviewer = await client.get(_url(INTERVIEWERS_OBJECT_ID, interviewer_id), headers=_hrone_headers(access_token), params={"appId": APP_ID})
+        params = _hrone_params()
+
+        job = await client.get(_url(JOBS_OBJECT_ID, job_id), headers=_hrone_headers(access_token), params=params)
+        applicant = await client.get(_url(APPLICANTS_OBJECT_ID, applicant_id), headers=_hrone_headers(access_token), params=params)
+        round_ = await client.get(_url(ROUNDS_OBJECT_ID, round_id), headers=_hrone_headers(access_token), params=params)
+        interviewer = await client.get(_url(INTERVIEWERS_OBJECT_ID, interviewer_id), headers=_hrone_headers(access_token), params=params)
 
         missing: list[str] = []
         if job.status_code != 200:
@@ -690,7 +689,7 @@ async def hrone_find_record_id_by_transcript_id(*, object_id: str, view_id: str,
     if not (object_id and view_id and transcript_id):
         return None
     async with httpx.AsyncClient(timeout=15.0) as client:
-        url = f"{HRONE_API}/objects/{object_id}/views/{view_id}/records"
+        url = f"{HRONE_API_URL}/objects/{object_id}/views/{view_id}/records"
         res = await client.post(
             url,
             headers=_hrone_headers(access_token),
@@ -705,8 +704,8 @@ async def hrone_find_record_id_by_transcript_id(*, object_id: str, view_id: str,
 
 async def hrone_create_record(*, object_id: str, values: list[dict], access_token: str | None) -> str:
     async with httpx.AsyncClient(timeout=15.0) as client:
-        url = f"{HRONE_API}/objects/{object_id}/records"
-        params = {} if HRONE_API_KEY else {"appId": APP_ID}  # No appId in params when using API key
+        url = f"{HRONE_API_URL}/objects/{object_id}/records"
+        params = {"appId": APP_ID}  # No appId in params when using API key
         res = await client.post(
             url,
             headers=_hrone_headers(access_token),
@@ -733,18 +732,18 @@ async def hrone_create_record(*, object_id: str, values: list[dict], access_toke
 
 async def hrone_get_record(*, object_id: str, record_id: str, access_token: str | None):
     async with httpx.AsyncClient(timeout=15.0) as client:
-        url = f"{HRONE_API}/objects/{object_id}/records/{record_id}"
-        res = await client.get(url, headers=_hrone_headers(access_token), params={"appId": APP_ID})
+        url = f"{HRONE_API_URL}/objects/{object_id}/records/{record_id}"
+        res = await client.get(url, headers=_hrone_headers(access_token), params=_hrone_params())
         return res
 
 
 async def hrone_update_record(*, object_id: str, record_id: str, values: list[dict], access_token: str | None) -> None:
     async with httpx.AsyncClient(timeout=15.0) as client:
-        url = f"{HRONE_API}/objects/{object_id}/records/{record_id}"
+        url = f"{HRONE_API_URL}/objects/{object_id}/records/{record_id}"
         res = await client.patch(
             url,
             headers=_hrone_headers(access_token),
-            params={"appId": APP_ID},
+            params=_hrone_params(),
             json=_values_payload(values),
         )
         if res.status_code not in (200, 204):
@@ -794,6 +793,123 @@ async def resolve_ids_from_interview(*, interview_id: str, email: str, access_to
         raise HTTPException(403, f"Email mismatch for this interviewId (expected: {expected_email})")
 
     return str(applicant_id), str(job_id), str(round_id), str(interviewer_id)
+
+
+async def resolve_ids_from_round(*, round_id: str, email: str, access_token: str | None) -> tuple[str, str, str, str]:
+    """Resolve applicant_id, job_id, round_id, interviewer_id from roundId and email."""
+    # Get round details
+    res = await hrone_get_record(object_id=ROUNDS_OBJECT_ID, record_id=str(round_id), access_token=access_token)
+    if res.status_code == 401:
+        raise HTTPException(401, f"Unauthorized access to HROne API: {res.text}")
+    if res.status_code != 200:
+        raise HTTPException(res.status_code, f"Round not found: {res.text}")
+    round_rec = res.json()
+    
+    # Extract jobID and interviewerID from round
+    job_id = extract_field_value(round_rec, "jobID")
+    interviewer_id = extract_field_value(round_rec, "interviewerID")
+    if isinstance(job_id, dict):
+        job_id = job_id.get("id")
+    if isinstance(interviewer_id, dict):
+        interviewer_id = interviewer_id.get("id")
+    
+    if not job_id or not interviewer_id:
+        missing = []
+        if not job_id:
+            missing.append("jobID")
+        if not interviewer_id:
+            missing.append("interviewerID")
+        raise HTTPException(500, f"Round record missing fields: {', '.join(missing)}")
+    
+    # Find applicant by email
+    applicant_id = await _find_applicant_by_email(email=email, access_token=access_token)
+    if not applicant_id:
+        raise HTTPException(404, f"Applicant not found with email: {email}")
+    
+    return str(applicant_id), str(job_id), str(round_id), str(interviewer_id)
+
+
+async def _find_interview_by_applicant_and_round(*, applicant_id: str, round_id: str, access_token: str | None) -> str | None:
+    """Find interview record by applicantId, roundId, and status: 'Scheduled'."""
+    interviews_view_id = os.getenv("HRONE_INTERVIEWS_VIEW_ID", "")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        if interviews_view_id:
+            url = f"{HRONE_API_URL}/objects/{INTERVIEWS_OBJECT_ID}/views/{interviews_view_id}/records"
+            params = {"limit": 1, "offset": 0}
+            params["appId"] = APP_ID
+            filters = {
+                "$and": [
+                    {"key": "#.records.applicantId", "operator": "$eq", "value": applicant_id, "type": "linkedRecord"},
+                    {"key": "#.records.roundId", "operator": "$eq", "value": round_id, "type": "singleLineText"},
+                    {"key": "#.records.status", "operator": "$eq", "value": "Scheduled", "type": "select"},
+                ]
+            }
+        else:
+            url = f"{HRONE_API_URL}/objects/{INTERVIEWS_OBJECT_ID}/records"
+            params = {"limit": 1}
+            if not HRONE_API_KEY:
+                params["appId"] = APP_ID
+            filters = {
+                "$and": [
+                    {"key": "applicantId", "operator": "$eq", "value": applicant_id, "type": "linkedRecord"},
+                    {"key": "roundId", "operator": "$eq", "value": round_id, "type": "singleLineText"},
+                    {"key": "status", "operator": "$eq", "value": "Scheduled", "type": "select"},
+                ]
+            }
+        
+        res = await client.post(
+            url,
+            headers=_hrone_headers(access_token),
+            params=params,
+            json={"filters": filters},
+        )
+        
+        if res.status_code == 200:
+            data = res.json()
+            records = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            if records and isinstance(records[0], dict):
+                return records[0].get("id")
+    return None
+
+
+async def _find_applicant_by_email(*, email: str, access_token: str | None) -> str | None:
+    """Find applicant record ID by email using view search."""
+    applicants_view_id = os.getenv("HRONE_APPLICANTS_VIEW_ID", "")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        if applicants_view_id:
+            # Use view to find by email
+            url = f"{HRONE_API_URL}/objects/{APPLICANTS_OBJECT_ID}/views/{applicants_view_id}/records"
+            params = {"limit": 1, "offset": 0}
+            params["appId"] = APP_ID
+            res = await client.post(
+                url,
+                headers=_hrone_headers(access_token),
+                params=params,
+                json={
+                    "filters": {"$and": [{"key": "#.records.email", "operator": "$eq", "value": email, "type": "singleLineText"}]},
+                },
+            )
+        # else:
+        #     # Search directly in records
+        #     url = f"{HRONE_API_URL}/objects/{APPLICANTS_OBJECT_ID}/records"
+        #     params = {"limit": 1}
+        #     if not HRONE_API_KEY:
+        #         params["appId"] = APP_ID
+        #     res = await client.post(
+        #         url,
+        #         headers=_hrone_headers(access_token),
+        #         params=params,
+        #         json={
+        #             "filters": {"$and": [{"key": "email", "operator": "$eq", "value": email, "type": "singleLineText"}]},
+        #         },
+        #     )
+        
+        if res.status_code == 200:
+            data = res.json()
+            records = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            if records and isinstance(records[0], dict):
+                return records[0].get("id")
+    return None
 
 
 async def _create_transcript_record(interview_id: str, access_token: str | None) -> str | None:
@@ -856,13 +972,21 @@ def _token_for_transcript(request: Request, *, interview_id: str, record_id: str
 # Public route handlers (called by main.py)
 # -----------------------------------------------------------------------------
 
-async def handle_start_interview(*, interview_id: str, email: str, request: Request) -> dict:
+async def handle_start_interview(*, round_id: str, email: str, request: Request) -> dict:
     hrone_token, hrone_token_source = _extract_access_token_with_source(request)
+    applicant_id, job_id, round_id, interviewer_id = await resolve_ids_from_round(
+        round_id=round_id, email=email, access_token=hrone_token
+    )
+    
+    # Check if interview record exists with applicantId, roundId, and status: "Scheduled"
+    interview_id = await _find_interview_by_applicant_and_round(
+        applicant_id=applicant_id, round_id=round_id, access_token=hrone_token
+    )
+    if not interview_id:
+        raise HTTPException(404, f"Interview not found with applicantId={applicant_id}, roundId={round_id}, status='Scheduled'")
+    
     if hrone_token:
         _HRONE_TOKEN_BY_INTERVIEW_ID[interview_id] = hrone_token
-    applicant_id, job_id, round_id, interviewer_id = await resolve_ids_from_interview(
-        interview_id=interview_id, email=email, access_token=hrone_token
-    )
 
     interview_data = await fetch_interview_data(
         job_id=job_id,
@@ -887,7 +1011,7 @@ async def handle_start_interview(*, interview_id: str, email: str, request: Requ
         if hrone_token:
             _HRONE_TOKEN_BY_RECORD_ID[transcript_record_id] = hrone_token
 
-    # Setup LiveKit room and token
+    # Setup LiveKit room and token (use interviewId for room name)
     room = f"interview-{interview_id}"
     identity = f"candidate-{applicant_id}"
     token = _create_livekit_token(identity, participant_name, room)
@@ -1005,11 +1129,8 @@ async def _get_dispatch_info(lk: api.LiveKitAPI, dispatch: api.AgentDispatch, ro
         status = getattr(js, "status", None)
         status_str = agent_proto.JobStatus.Name(status) if isinstance(status, int) else str(status) if status else None
         identity = getattr(js, "participant_identity", None)
-        
-        # Get worker ID from job state
-        worker_id = getattr(js, "worker_id", None) or getattr(jobs[0], "worker_id", None)
-        
-        return status_str, identity, worker_id
+        worker_id = getattr(js, "worker_id", None) if js else None
+        return status_str, identity, str(worker_id) if worker_id else None
     except Exception:
         return None, None, None
 

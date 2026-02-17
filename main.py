@@ -41,7 +41,7 @@ app.add_middleware(
 
 
 class StartInterviewRequest(BaseModel):
-    interviewId: str
+    roundId: str
     email: str
 
 
@@ -78,7 +78,7 @@ class GenerateJobDescriptionRequest(BaseModel):
 @app.post("/api/start-interview")
 async def api_start_interview(req: StartInterviewRequest, request: Request):
     try:
-        return await handle_start_interview(interview_id=req.interviewId, email=req.email, request=request)
+        return await handle_start_interview(round_id=req.roundId, email=req.email, request=request)
     except HTTPException:
         # Re-raise HTTPException to return proper status codes
         raise
