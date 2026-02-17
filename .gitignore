@@ -9,3 +9,9 @@ wheels/
 # Virtual environments
 .venv
 .env
+.env.*
+
+# Logs
+logs/
+*.log
+uv.lock
