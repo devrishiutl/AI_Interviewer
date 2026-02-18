@@ -1,4 +1,4 @@
-# AI Interviewer LiveKit - Dependencies
+# AI Interviewer LiveKit - Dependencies (generated from pyproject.toml)
 
 # LiveKit Agents Framework
 livekit-agents[deepgram,openai,cartesia,silero,turn-detector]~=1.2
@@ -25,6 +25,8 @@ pyjwt>=2.10.1
 # Compatibility
 numpy<2.0
 
-# Optional (LLM provider abstraction)
-# Install if you set LLM_BACKEND=dspy
-dspy-ai>=2.5.0
+# DSPy / LLM integration
+dspy-ai>=3.1.2
+
+# Note: additional system packages (ffmpeg, build-essential) may be required
+# for some audio/extension dependencies when building inside Docker.

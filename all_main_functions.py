@@ -26,6 +26,8 @@ from livekit import api
 from livekit.api.twirp_client import TwirpError
 from livekit.protocol import agent as agent_proto
 from livekit.protocol import room as room_proto
+import json
+import requests
 
 # Setup logging to file
 _LOG_DIR = Path(__file__).parent / "logs"
@@ -252,6 +254,24 @@ FEEDBACK_PROP_ID_EXPERIENCE = os.getenv("HRONE_FEEDBACK_PROP_ID_EXPERIENCE", "")
 FEEDBACK_PROP_ID_RATING = os.getenv("HRONE_FEEDBACK_PROP_ID_RATING", "")
 FEEDBACK_PROP_ID_TIMESTAMP = os.getenv("HRONE_FEEDBACK_PROP_ID_TIMESTAMP", "")
 
+##==========================================================
+# Interviews review propertyIds - support both HRONE_ prefixed and plain env names
+INTERVIEWS_PROP_ID_SUMMARY = os.getenv("HRONE_INTERVIEWS_PROP_ID_SUMMARY") or os.getenv("INTERVIEWS_PROP_ID_SUMMARY", "")
+INTERVIEWS_PROP_ID_STRENGTHS = os.getenv("HRONE_INTERVIEWS_PROP_ID_STRENGTHS") or os.getenv("INTERVIEWS_PROP_ID_STRENGTHS", "")
+INTERVIEWS_PROP_ID_WEAKNESSES = os.getenv("HRONE_INTERVIEWS_PROP_ID_WEAKNESSES") or os.getenv("INTERVIEWS_PROP_ID_WEAKNESSES", "")
+INTERVIEWS_PROP_ID_RECOMMENDATION = os.getenv("HRONE_INTERVIEWS_PROP_ID_RECOMMENDATION") or os.getenv("INTERVIEWS_PROP_ID_RECOMMENDATION", "")
+INTERVIEWS_PROP_ID_CATEGORY_SCORES = os.getenv("HRONE_INTERVIEWS_PROP_ID_CATEGORY_SCORES") or os.getenv("INTERVIEWS_PROP_ID_CATEGORY_SCORES", "")
+
+# Optional child propertyIds for categoryScores nested fields
+INTERVIEWS_PROP_ID_CATEGORY_SCORES_TECHNICAL = os.getenv("HRONE_INTERVIEWS_PROP_ID_CATEGORY_SCORES_TECHNICAL") or os.getenv("INTERVIEWS_PROP_ID_CATEGORY_SCORES_TECHNICAL", "")
+INTERVIEWS_PROP_ID_CATEGORY_SCORES_COMMUNICATION = os.getenv("HRONE_INTERVIEWS_PROP_ID_CATEGORY_SCORES_COMMUNICATION") or os.getenv("INTERVIEWS_PROP_ID_CATEGORY_SCORES_COMMUNICATION", "")
+INTERVIEWS_PROP_ID_CATEGORY_SCORES_PROBLEM_SOLVING = os.getenv("HRONE_INTERVIEWS_PROP_ID_CATEGORY_SCORES_PROBLEM_SOLVING") or os.getenv("INTERVIEWS_PROP_ID_CATEGORY_SCORES_PROBLEM_SOLVING", "")
+INTERVIEWS_PROP_ID_CATEGORY_SCORES_LEADERSHIP = os.getenv("HRONE_INTERVIEWS_PROP_ID_CATEGORY_SCORES_LEADERSHIP") or os.getenv("INTERVIEWS_PROP_ID_CATEGORY_SCORES_LEADERSHIP", "")
+INTERVIEWS_PROP_ID_CATEGORY_SCORES_CULTURE_FIT = os.getenv("HRONE_INTERVIEWS_PROP_ID_CATEGORY_SCORES_CULTURE_FIT") or os.getenv("INTERVIEWS_PROP_ID_CATEGORY_SCORES_CULTURE_FIT", "")
+
+# Optional status field propertyId
+INTERVIEWS_PROP_ID_STATUS = os.getenv("HRONE_INTERVIEWS_PROP_ID_STATUS") or os.getenv("INTERVIEWS_PROP_ID_STATUS", "")
+
 # Interviews table
 INTERVIEWS_OBJECT_ID = _require_env("HRONE_INTERVIEWS_OBJECT_ID")
 
@@ -466,6 +486,26 @@ def _extract_access_token_with_source(request: Request | None) -> tuple[str | No
     return None, "none"
 
 
+# def _hrone_headers(access_token: str | None) -> dict:
+#     headers = {
+#         "Content-Type": "application/json",
+#         "x-app-id": APP_ID,
+#         "x-org-id": ORG_ID,
+#     }
+
+#     token = (access_token or "").strip()
+#     if token:
+#         # Prefer request token (Authorization Bearer — extracted from Authorization header or cookies)
+#         headers["Authorization"] = f"Bearer {token}"
+#         return headers
+
+#     # Fallback to server-side API key if no request token present
+#     if HRONE_API_KEY:
+#         headers["x-api-key"] = HRONE_API_KEY
+#         return headers
+
+#     raise HTTPException(401, "Missing HROne API key or access token")
+
 def _hrone_headers(access_token: str | None) -> dict:
     headers = {
         "Content-Type": "application/json",
@@ -475,22 +515,48 @@ def _hrone_headers(access_token: str | None) -> dict:
 
     token = (access_token or "").strip()
     if token:
-        # Prefer request token (Authorization Bearer — extracted from Authorization header or cookies)
         headers["Authorization"] = f"Bearer {token}"
-        return headers
-
-    # Fallback to server-side API key if no request token present
-    if HRONE_API_KEY:
+    elif HRONE_API_KEY:
         headers["x-api-key"] = HRONE_API_KEY
-        return headers
+    else:
+        raise HTTPException(401, "Missing HROne API key or access token")
 
-    raise HTTPException(401, "Missing HROne API key or access token")
+    return headers
+
+
 
 
 def _values_payload(values: list[dict]) -> dict:
-    pids = [v["propertyId"] for v in values if isinstance(v.get("propertyId"), str) and v.get("propertyId")]
-    # Keeper API requires both values with key field and propertyIds array
-    return {"values": values, "propertyIds": pids}
+    pids: list[str] = []
+    def _collect_from_value(val):
+        # val may be a dict with propertyId
+        if isinstance(val, dict):
+            pid = val.get("propertyId")
+            if isinstance(pid, str) and pid:
+                pids.append(pid)
+        # or list of nested cells (e.g., nested field value list)
+        if isinstance(val, list):
+            for item in val:
+                if isinstance(item, dict) and isinstance(item.get("propertyId"), str) and item.get("propertyId"):
+                    pids.append(item.get("propertyId"))
+                else:
+                    _collect_from_value(item)
+
+    for v in values:
+        if isinstance(v.get("propertyId"), str) and v.get("propertyId"):
+            pids.append(v.get("propertyId"))
+        # collect nested propertyIds from the value itself
+        _collect_from_value(v.get("value"))
+
+    # Deduplicate while preserving order
+    seen = set()
+    uniq: list[str] = []
+    for x in pids:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
+
+    return {"values": values, "propertyIds": uniq}
 
 
 
@@ -829,46 +895,86 @@ async def resolve_ids_from_round(*, round_id: str, email: str, access_token: str
     return str(applicant_id), str(job_id), str(round_id), str(interviewer_id)
 
 
-async def _find_interview_by_applicant_and_round(*, applicant_id: str, round_id: str, access_token: str | None) -> str | None:
+async def _find_interview_by_applicant_and_round(
+    *, applicant_id: str, round_id: str, access_token: str | None
+) -> str | None:
     """Find interview record by applicantId, roundId, and status: 'Scheduled'."""
+
     interviews_view_id = os.getenv("HRONE_INTERVIEWS_VIEW_ID", "")
+    using_api_key = not bool(access_token)  # If no bearer token → API key mode
+
     async with httpx.AsyncClient(timeout=15.0) as client:
-        if interviews_view_id:
+
+        # 🔹 Use VIEW only when using Bearer token
+        if interviews_view_id and not using_api_key:
             url = f"{HRONE_API_URL}/objects/{INTERVIEWS_OBJECT_ID}/views/{interviews_view_id}/records"
-            params = {"limit": 1, "offset": 0}
-            params["appId"] = APP_ID
+            params = {"limit": 1, "offset": 0, "appId": APP_ID}
+
             filters = {
                 "$and": [
-                    {"key": "#.records.applicantId", "operator": "$eq", "value": applicant_id, "type": "linkedRecord"},
-                    {"key": "#.records.roundId", "operator": "$eq", "value": round_id, "type": "singleLineText"},
-                    {"key": "#.records.status", "operator": "$eq", "value": "Scheduled", "type": "select"},
+                    {
+                        "key": "#.records.applicantId",
+                        "operator": "$eq",
+                        "value": applicant_id,
+                        "type": "linkedRecord",
+                    },
+                    {
+                        "key": "#.records.roundId",
+                        "operator": "$eq",
+                        "value": round_id,
+                        "type": "singleLineText",
+                    },
+                    {
+                        "key": "#.records.status",
+                        "operator": "$eq",
+                        "value": "Scheduled",
+                        "type": "select",
+                    },
                 ]
             }
+
+        # 🔹 Use DIRECT RECORD SEARCH for API key
         else:
             url = f"{HRONE_API_URL}/objects/{INTERVIEWS_OBJECT_ID}/records"
-            params = {"limit": 1}
-            if not HRONE_API_KEY:
-                params["appId"] = APP_ID
+            params = {"limit": 1, "appId": APP_ID}
+
             filters = {
                 "$and": [
-                    {"key": "applicantId", "operator": "$eq", "value": applicant_id, "type": "linkedRecord"},
-                    {"key": "roundId", "operator": "$eq", "value": round_id, "type": "singleLineText"},
-                    {"key": "status", "operator": "$eq", "value": "Scheduled", "type": "select"},
+                    {
+                        "key": "applicantId",
+                        "operator": "$eq",
+                        "value": applicant_id,
+                        "type": "linkedRecord",
+                    },
+                    {
+                        "key": "roundId",
+                        "operator": "$eq",
+                        "value": round_id,
+                        "type": "singleLineText",
+                    },
+                    {
+                        "key": "status",
+                        "operator": "$eq",
+                        "value": "Scheduled",
+                        "type": "select",
+                    },
                 ]
             }
-        
+
         res = await client.post(
             url,
             headers=_hrone_headers(access_token),
             params=params,
             json={"filters": filters},
         )
-        
+
+
         if res.status_code == 200:
             data = res.json()
-            records = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-            if records and isinstance(records[0], dict):
+            records = data.get("data", []) if isinstance(data, dict) else []
+            if records:
                 return records[0].get("id")
+
     return None
 
 
@@ -1025,7 +1131,7 @@ async def handle_start_interview(*, round_id: str, email: str, request: Request)
         "success": True,
         "token": token.to_jwt(),
         "room": room,
-        "livekitUrl": os.getenv("PUBLIC_LIVEKIT_URL", LIVEKIT_URL),
+        "livekitUrl": os.getenv("PUBLIC_LIVEKIT_URL", LIVEKIT_URL).replace("host.docker.internal", "localhost"),
         "livekitAgentName": LIVEKIT_AGENT_NAME,
         "identity": identity,
         "transcriptRecordId": transcript_record_id,
@@ -1231,3 +1337,233 @@ async def handle_feedback(
         return {"success": True, "feedbackRecordId": record_id}
     except HTTPException as e:
         return {"success": False, "reason": str(e.detail)}
+    
+
+
+##========================
+async def generate_interview_review(*, transcript_text: str) -> dict:
+    """Generate interview review (summary, strengths, weaknesses, recommendation, categoryScores) using DSPy."""
+    try:
+        import dspy
+    except ImportError:
+        # fallback simple heuristic
+        lines = (transcript_text or "").splitlines()
+        summary = "\n".join(lines[:10])[:2000]
+        strengths = "Good communication and problem solving observed." if "candidate" in (transcript_text or "").lower() else ""
+        weaknesses = ""
+        recommendation = "Maybe"
+        cat = {"technical": 6, "communication": 6, "problemSolving": 6, "leadership": 5, "cultureFit": 6}
+        return {"summary": summary, "strengths": strengths, "weaknesses": weaknesses, "recommendation": recommendation, "categoryScores": cat}
+
+    provider = (os.getenv("DSPY_PROVIDER") or "openai").strip().lower()
+    model_name = (os.getenv("LLM_MODEL") or "gpt-4o-mini").strip()
+    api_key = (os.getenv("DSPY_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("Missing DSPY_API_KEY or OPENAI_API_KEY for DSPy")
+
+    # Model path handling (same as generate_job_description)
+    if provider in ("claude", "anthropic"):
+        model_path = f"anthropic/{model_name}"
+    elif provider == "openai":
+        model_path = f"openai/{model_name}"
+    elif provider == "azure":
+        model_path = f"azure/{model_name}"
+        api_base = (os.getenv("AZURE_OPENAI_API_BASE") or "").strip()
+        if not api_base:
+            raise RuntimeError("AZURE_OPENAI_API_BASE is required when DSPY_PROVIDER=azure")
+        os.environ["AZURE_OPENAI_ENDPOINT"] = api_base
+        os.environ["AZURE_OPENAI_API_VERSION"] = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
+        os.environ["AZURE_OPENAI_API_KEY"] = api_key
+    else:
+        model_path = os.getenv("DSPY_MODEL_PATH", "")
+        if not model_path:
+            raise RuntimeError(f"Unsupported DSPY_PROVIDER={provider!r}")
+
+    try:
+        temperature = float(os.getenv("LLM_TEMPERATURE", "0.3"))
+    except Exception:
+        temperature = 0.3
+
+    prompt = (
+        "You are an assistant that reads an interview transcript and returns a JSON object only (no commentary) with keys:\n"
+        "  summary (string, multiline),\n"
+        "  strengths (string, multiline),\n"
+        "  weaknesses (string, multiline),\n"
+        "  recommendation (one of: \"Strong Yes\",\"Yes\",\"Maybe\",\"No\",\"Strong No\"),\n"
+        "  categoryScores (object with numbers: technical, communication, problemSolving, leadership, cultureFit)\n\n"
+        "Return valid JSON only. Transcript:\n\n" + (transcript_text or "")[:15000]
+    )
+
+    class ReviewSig(dspy.Signature):
+        transcript: str = dspy.InputField(desc="Interview transcript")
+        review_json: str = dspy.OutputField(desc="JSON review (string)")
+
+    # Ensure we always pass a string (not None) for api_base to avoid litellm logging errors
+    api_base_env = os.getenv("AZURE_OPENAI_API_BASE") or os.getenv("OPENAI_API_BASE") or ""
+    lm_kwargs = {"api_key": api_key, "cache": False, "temperature": temperature, "api_base": api_base_env}
+    lm = dspy.LM(model_path, **lm_kwargs)
+
+    def _predict():
+        with dspy.context(lm=lm):
+            res = dspy.Predict(ReviewSig)(transcript=prompt)
+            return (getattr(res, "review_json", "") or "").strip()
+
+    review_text = await asyncio.to_thread(_predict)
+
+    # try to parse JSON from response
+    try:
+        review = json.loads(review_text)
+    except Exception:
+        # last-resort: try to extract JSON substring
+        import re
+        m = re.search(r"(\{.*\})", review_text, re.S)
+        if m:
+            try:
+                review = json.loads(m.group(1))
+            except Exception:
+                review = {}
+        else:
+            review = {}
+
+    # Validate/normalize
+    allowed_recs = {"Strong Yes", "Yes", "Maybe", "No", "Strong No"}
+    if review.get("recommendation") not in allowed_recs:
+        review["recommendation"] = "Maybe"
+    if not isinstance(review.get("categoryScores"), dict):
+        review["categoryScores"] = review.get("categoryScores") or {"technical": 6, "communication": 6, "problemSolving": 6, "leadership": 5, "cultureFit": 6}
+
+    # ensure all keys present
+    out = {
+        "summary": review.get("summary", ""),
+        "strengths": review.get("strengths", ""),
+        "weaknesses": review.get("weaknesses", ""),
+        "recommendation": review.get("recommendation", "Maybe"),
+        "categoryScores": {
+            "technical": float(review["categoryScores"].get("technical", 0)),
+            "communication": float(review["categoryScores"].get("communication", 0)),
+            "problemSolving": float(review["categoryScores"].get("problemSolving", 0)),
+            "leadership": float(review["categoryScores"].get("leadership", 0)),
+            "cultureFit": float(review["categoryScores"].get("cultureFit", 0)),
+        },
+    }
+    return out
+
+
+async def generate_review_from_transcript(*, request: Request, interview_id: str, transcript_record_id: str) -> dict:
+    """Fetch transcript record, generate review via LLM, and update Interviews record."""
+    if not TRANSCRIPTS_OBJECT_ID or not INTERVIEWS_OBJECT_ID:
+        return {"success": False, "reason": "transcripts/interviews object not configured"}
+
+    access_token = None  # use server-side API key
+
+    # Fetch transcript record
+    res = await hrone_get_record(object_id=TRANSCRIPTS_OBJECT_ID, record_id=str(transcript_record_id), access_token=access_token)
+    if res.status_code != 200:
+        return {"success": False, "reason": f"Failed to fetch transcript record: {res.status_code} {res.text}"}
+
+    rec = res.json()
+    transcript_json = extract_field_value(rec, TRANSCRIPTS_FIELD_TRANSCRIPT_JSON) if rec else None
+    if transcript_json is None:
+        transcript_json = rec.get(TRANSCRIPTS_FIELD_TRANSCRIPT_JSON) if isinstance(rec, dict) else None
+
+    rows = transcript_json if isinstance(transcript_json, list) else []
+    parts: list[str] = []
+    for row in rows:
+        if isinstance(row, list):
+            m = {d.get("key"): d.get("value") for d in row if isinstance(d, dict)}
+            speaker = m.get("speakerName") or m.get("speaker") or m.get("role") or ""
+            text = m.get("text") or m.get("transcript") or ""
+            ts = m.get("timestamp")
+            if ts:
+                try:
+                    ts = int(ts)
+                    parts.append(f"[{ts}] {speaker}: {text}")
+                except Exception:
+                    parts.append(f"{speaker}: {text}")
+            else:
+                parts.append(f"{speaker}: {text}")
+        elif isinstance(row, dict):
+            text = row.get("text") or row.get("transcript") or str(row)
+            parts.append(str(text))
+        else:
+            parts.append(str(row))
+
+    transcript_text = "\n".join([p for p in parts if p])[:15000]
+
+    try:
+        review = await generate_interview_review(transcript_text=transcript_text)
+    except Exception as e:
+        return {"success": False, "reason": f"LLM generation failed: {e}"}
+
+    values: list[dict] = []
+    if review.get("summary") is not None:
+        values.append({"propertyId": INTERVIEWS_PROP_ID_SUMMARY, "key": "summary", "value": review.get("summary")} if INTERVIEWS_PROP_ID_SUMMARY else {"key": "summary", "value": review.get("summary")})
+    if review.get("strengths") is not None:
+        values.append({"propertyId": INTERVIEWS_PROP_ID_STRENGTHS, "key": "strengths", "value": review.get("strengths")} if INTERVIEWS_PROP_ID_STRENGTHS else {"key": "strengths", "value": review.get("strengths")})
+    if review.get("weaknesses") is not None:
+        values.append({"propertyId": INTERVIEWS_PROP_ID_WEAKNESSES, "key": "weaknesses", "value": review.get("weaknesses")} if INTERVIEWS_PROP_ID_WEAKNESSES else {"key": "weaknesses", "value": review.get("weaknesses")})
+    if review.get("recommendation") is not None:
+        values.append({"propertyId": INTERVIEWS_PROP_ID_RECOMMENDATION, "key": "recommendation", "value": review.get("recommendation")} if INTERVIEWS_PROP_ID_RECOMMENDATION else {"key": "recommendation", "value": review.get("recommendation")})
+    if isinstance(review.get("categoryScores"), dict):
+        cs = review.get("categoryScores") or {}
+        # If per-field property ids are provided, include them nested with propertyIds
+        if INTERVIEWS_PROP_ID_CATEGORY_SCORES and any([
+            INTERVIEWS_PROP_ID_CATEGORY_SCORES_TECHNICAL,
+            INTERVIEWS_PROP_ID_CATEGORY_SCORES_COMMUNICATION,
+            INTERVIEWS_PROP_ID_CATEGORY_SCORES_PROBLEM_SOLVING,
+            INTERVIEWS_PROP_ID_CATEGORY_SCORES_LEADERSHIP,
+            INTERVIEWS_PROP_ID_CATEGORY_SCORES_CULTURE_FIT,
+        ]):
+            nested = []
+            if "technical" in cs:
+                nested.append({
+                    "propertyId": INTERVIEWS_PROP_ID_CATEGORY_SCORES_TECHNICAL or "",
+                    "key": "technical",
+                    "value": cs.get("technical"),
+                })
+            if "communication" in cs:
+                nested.append({
+                    "propertyId": INTERVIEWS_PROP_ID_CATEGORY_SCORES_COMMUNICATION or "",
+                    "key": "communication",
+                    "value": cs.get("communication"),
+                })
+            if "problemSolving" in cs:
+                nested.append({
+                    "propertyId": INTERVIEWS_PROP_ID_CATEGORY_SCORES_PROBLEM_SOLVING or "",
+                    "key": "problemSolving",
+                    "value": cs.get("problemSolving"),
+                })
+            if "leadership" in cs:
+                nested.append({
+                    "propertyId": INTERVIEWS_PROP_ID_CATEGORY_SCORES_LEADERSHIP or "",
+                    "key": "leadership",
+                    "value": cs.get("leadership"),
+                })
+            if "cultureFit" in cs:
+                nested.append({
+                    "propertyId": INTERVIEWS_PROP_ID_CATEGORY_SCORES_CULTURE_FIT or "",
+                    "key": "cultureFit",
+                    "value": cs.get("cultureFit"),
+                })
+
+            values.append({
+                "propertyId": INTERVIEWS_PROP_ID_CATEGORY_SCORES,
+                "key": "categoryScores",
+                "value": nested,
+            })
+        else:
+            values.append({"propertyId": INTERVIEWS_PROP_ID_CATEGORY_SCORES, "key": "categoryScores", "value": review.get("categoryScores")} 
+                          if INTERVIEWS_PROP_ID_CATEGORY_SCORES else {"key": "categoryScores", "value": review.get("categoryScores")})
+
+    # Always set interview status to Completed
+    if True:
+        values.append({"propertyId": INTERVIEWS_PROP_ID_STATUS, "key": "status", "value": "Completed"} if INTERVIEWS_PROP_ID_STATUS else {"key": "status", "value": "Completed"})
+
+    if not values:
+        return {"success": False, "reason": "no review fields to update"}
+
+    try:
+        await hrone_update_record(object_id=INTERVIEWS_OBJECT_ID, record_id=str(interview_id), values=values, access_token=access_token)
+        return {"success": True, "review": review}
+    except HTTPException as e:
+        return {"success": False, "reason": f"HROne update failed: {e.detail}"}

@@ -1,0 +1,30 @@
+services:
+  app:
+    build: .
+    container_name: ai_interviewer_app
+    ports:
+      - "8021:8021"
+    env_file:
+      - .env
+    environment:
+      - LIVEKIT_URL=ws://host.docker.internal:7880
+      - HRONE_API_URL=http://host.docker.internal:8000/api
+    restart: unless-stopped
+    volumes:
+      - ./:/app
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8021/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  agent:
+    build: .
+    container_name: ai_interviewer_agent
+    command: ["python", "agent.py", "start"]
+    env_file:
+      - .env
+    environment:
+      - LIVEKIT_URL=ws://host.docker.internal:7880
+    volumes:
+      - ./:/app
+    restart: unless-stopped

@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from all_main_functions import handle_start_interview, handle_transcript, handle_feedback
+from all_main_functions import handle_start_interview, handle_transcript, handle_feedback, generate_review_from_transcript
 from all_llm_main_functions import generate_job_description
 
 
@@ -68,6 +68,11 @@ class GenerateJobDescriptionRequest(BaseModel):
     jobType: str | None = None
     minExp: int | None = None
     maxExp: int | None = None
+
+
+class UpdateInterviewReviewRequest(BaseModel):
+    interviewId: str
+    transcriptRecordId: str
 
 
 # -----------------------------------------------------------------------------
@@ -189,6 +194,21 @@ async def api_generate_job_description(req: GenerateJobDescriptionRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Internal server error: {type(e).__name__}: {str(e)}"
         )
+
+
+##=============================================================================
+@app.post("/api/update-interview-review")
+async def api_update_interview_review(
+    req: UpdateInterviewReviewRequest,
+    request: Request,
+):
+    """
+    Accepts JSON body with `interviewId` and `transcriptRecordId`, fetches transcript,
+    generates review (using DSPy if configured), and updates the interview record in HROne
+    using the server-side HRONE_API_KEY.
+    """
+    return await generate_review_from_transcript(request=request, interview_id=req.interviewId, transcript_record_id=req.transcriptRecordId)
+
 
 
 if __name__ == "__main__":
